@@ -4,8 +4,8 @@
 original assets through the Immich API, re-encodes images to JPEG XL and video
 to AV1/Opus MP4, uploads the result, copies metadata, verifies that the new
 asset is readable, and only then deletes the original. It runs against a
-self-hosted Immich library in one-shot, polling-daemon, or webhook-listener
-mode.
+self-hosted Immich library in one-shot or polling-daemon mode, and exposes a
+webhook listener that currently performs dry-run discovery only.
 
 ## Problem
 
