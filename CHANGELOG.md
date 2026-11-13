@@ -34,6 +34,11 @@
 
 ### Added
 
+- The `foundry` feature in `media-oxide`: the Foundry VTT conversion policy for
+  tokens, maps, tiles, artwork, and audio. It plans and runs `ffmpeg`
+  (`libwebp`, `libvpx-vp9`, `libvorbis`, `libopus`) conversions, normalizes file
+  names, sizes SVGs, and offers process-free `allowed_upload` and
+  `sniff_matches` checks for server-side validation.
 - `media-oxide`, a shared crate for JPEG XL encoding through `cjxl`,
   container metadata stripping, and optional jxl-oxide decoding, validation,
   header dimensions, and progressive-preview cuts. `rs-immicher-oxide-codec-jxl`

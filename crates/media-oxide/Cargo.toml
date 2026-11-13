@@ -16,6 +16,9 @@ include = ["Cargo.toml", "README.md", "src/**"]
 # JPEG XL decoding, validation, dimensions, and preview cuts. The default
 # feature set only shells out to `cjxl` and parses the container.
 decode = ["dep:image", "dep:jxl-frame", "dep:jxl-oxide"]
+# Foundry VTT asset conversion policy (`ffmpeg`/`ffprobe`) and the pure
+# upload-validation helpers a server calls.
+foundry = []
 
 [dependencies]
 image = { version = "0.25", default-features = false, optional = true }

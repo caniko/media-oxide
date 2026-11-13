@@ -42,6 +42,8 @@ design constraint.
 
 - Immich asset discovery, download, upload, metadata copy, and deletion.
 - JPEG XL image transcoding and SVT-AV1/Opus video transcoding.
+- Foundry VTT asset conversion and upload validation in `media-oxide`, driven by
+  `ffmpeg`.
 - One-shot, watcher, and webhook CLI modes.
 - A NixOS module, `nixosModules.immich-convert-originals`, that runs the watcher
   as a service with an external API-key file.
