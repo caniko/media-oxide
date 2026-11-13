@@ -19,7 +19,106 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-media-oxide:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require independently qualified publisher engine
+        env:
+          PUBLISHER_REVISION: ${{ vars.SIMIT_PUBLISHER_REVISION }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISHER_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Enroll a qualified immutable Simit publisher revision' >&2; exit 1; }
+      - name: Checkout independent publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Checkout qualified publisher engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: caniko/simit
+          ref: ${{ vars.SIMIT_PUBLISHER_REVISION }}
+          path: .simit-publisher-engine
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Build trusted publisher engine
+        working-directory: /
+        run: cargo build --release --locked --manifest-path "$GITHUB_WORKSPACE/.simit-publisher-engine/Cargo.toml" --target-dir "$GITHUB_WORKSPACE/.simit-publisher-engine/target"
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Configure GitHub input transport
+        run: |
+          git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
+          git config --global --add url.https://github.com/.insteadOf git@github.com:
+
+      - name: Admit signed source and provider-bound archive media-oxide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package media-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-media-oxide" > "$RUNNER_TEMP/verified-media-oxide.json"
+      - name: Checkout original signed source for verification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: .simit-release-source
+          persist-credentials: false
+      - name: Verify packaged contents media-oxide
+        working-directory: .simit-release-source
+        env:
+          NIX_CONFIG: "experimental-features = nix-command flakes"
+          XDG_CACHE_HOME: "/tmp/.cache"
+          CARGO_HOME: "/tmp/.cargo"
+        run: nix develop -c cargo publish --dry-run --locked --manifest-path "$RUNNER_TEMP/verified-media-oxide/Cargo.toml"
+  publish-media-oxide:
+    needs: [verify-media-oxide]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment:
+      name: simit-crates-io
+    steps:
+      - name: Require independently qualified publisher engine
+        env:
+          PUBLISHER_REVISION: ${{ vars.SIMIT_PUBLISHER_REVISION }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISHER_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Enroll a qualified immutable Simit publisher revision' >&2; exit 1; }
+      - name: Checkout independent publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Checkout qualified publisher engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: caniko/simit
+          ref: ${{ vars.SIMIT_PUBLISHER_REVISION }}
+          path: .simit-publisher-engine
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Build trusted publisher engine
+        working-directory: /
+        run: cargo build --release --locked --manifest-path "$GITHUB_WORKSPACE/.simit-publisher-engine/Cargo.toml" --target-dir "$GITHUB_WORKSPACE/.simit-publisher-engine/target"
+      - name: Upload independently verified archive media-oxide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package media-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   verify-rs-immicher-oxide-core:
+    needs: [publish-media-oxide]
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -64,7 +163,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-core --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-core" > "$RUNNER_TEMP/verified-rs-immicher-oxide-core.json"
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-core --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-core" > "$RUNNER_TEMP/verified-rs-immicher-oxide-core.json"
       - name: Checkout original signed source for verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,7 +215,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-core --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-core --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   verify-rs-immicher-oxide-backend-immich:
     needs: [publish-rs-immicher-oxide-core]
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
@@ -163,7 +262,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-backend-immich --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-backend-immich" > "$RUNNER_TEMP/verified-rs-immicher-oxide-backend-immich.json"
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-backend-immich --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-backend-immich" > "$RUNNER_TEMP/verified-rs-immicher-oxide-backend-immich.json"
       - name: Checkout original signed source for verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -215,7 +314,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-backend-immich --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-backend-immich --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   verify-rs-immicher-oxide-codec-av1:
     needs:
       - publish-rs-immicher-oxide-backend-immich
@@ -264,7 +363,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-av1 --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-av1" > "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-av1.json"
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-av1 --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-av1" > "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-av1.json"
       - name: Checkout original signed source for verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -316,9 +415,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-av1 --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-av1 --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   verify-rs-immicher-oxide-codec-jxl:
-    needs: [publish-rs-immicher-oxide-codec-av1, publish-rs-immicher-oxide-core]
+    needs:
+      - publish-media-oxide
+      - publish-rs-immicher-oxide-codec-av1
+      - publish-rs-immicher-oxide-core
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -363,7 +465,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-jxl --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-jxl" > "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-jxl.json"
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-jxl --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-jxl" > "$RUNNER_TEMP/verified-rs-immicher-oxide-codec-jxl.json"
       - name: Checkout original signed source for verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -415,7 +517,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-jxl --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide-codec-jxl --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   verify-rs-immicher-oxide:
     needs:
       - publish-rs-immicher-oxide-backend-immich
@@ -466,7 +568,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide" > "$RUNNER_TEMP/verified-rs-immicher-oxide.json"
+          .simit-publisher-engine/target/release/simit release publisher --publisher-stage prepare --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide --publisher-output "$RUNNER_TEMP/verified-rs-immicher-oxide" > "$RUNNER_TEMP/verified-rs-immicher-oxide.json"
       - name: Checkout original signed source for verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -518,9 +620,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CRATES_IO_API_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
+        run: .simit-publisher-engine/target/release/simit release publisher --publisher-stage publish --repo "$GITHUB_REPOSITORY" --package rs-immicher-oxide --source-workflow .github/workflows/publish-workspace.yaml --publisher-workflow .github/workflows/trusted-publish-workspace.yaml --reconstruct-package media-oxide --reconstruct-package rs-immicher-oxide-core --reconstruct-package rs-immicher-oxide-backend-immich --reconstruct-package rs-immicher-oxide-codec-av1 --reconstruct-package rs-immicher-oxide-codec-jxl --reconstruct-package rs-immicher-oxide
   publish-report:
     needs:
+      - publish-media-oxide
       - publish-rs-immicher-oxide-core
       - publish-rs-immicher-oxide-backend-immich
       - publish-rs-immicher-oxide-codec-av1

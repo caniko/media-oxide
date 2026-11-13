@@ -92,6 +92,12 @@ jobs:
             exit 1
           fi
 
+      - name: Test media-oxide
+        run: nix develop -c cargo test --locked -p media-oxide --all-targets --all-features
+      - name: Clippy media-oxide
+        run: nix develop -c cargo clippy --locked -p media-oxide --all-targets --all-features -- -D warnings
+      - name: Document media-oxide
+        run: nix develop -c cargo doc --locked -p media-oxide --no-deps --all-features
       - name: Test rs-immicher-oxide-core
         run: nix develop -c cargo test --locked -p rs-immicher-oxide-core --all-targets --all-features
       - name: Clippy rs-immicher-oxide-core
@@ -123,7 +129,22 @@ jobs:
       - name: Document rs-immicher-oxide
         run: nix develop -c cargo doc --locked -p rs-immicher-oxide --no-deps --all-features
       - name: Package coordinated release set
-        run: nix develop -c cargo package --locked --allow-dirty --no-verify -p rs-immicher-oxide-core -p rs-immicher-oxide-backend-immich -p rs-immicher-oxide-codec-av1 -p rs-immicher-oxide-codec-jxl -p rs-immicher-oxide --target-dir "$RUNNER_TEMP/simit-package-target"
+        run: nix develop -c cargo package --locked --allow-dirty --no-verify -p media-oxide -p rs-immicher-oxide-core -p rs-immicher-oxide-backend-immich -p rs-immicher-oxide-codec-av1 -p rs-immicher-oxide-codec-jxl -p rs-immicher-oxide --target-dir "$RUNNER_TEMP/simit-package-target"
+      - name: Build immutable archive media-oxide
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          test "$(nix develop -c cargo pkgid --locked -p media-oxide | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
+          mkdir -p "$RUNNER_TEMP/simit-crates/media-oxide"
+          cp "$RUNNER_TEMP/simit-package-target/package/media-oxide-$version.crate" "$RUNNER_TEMP/simit-crates/media-oxide/"
+      - name: Retain original-run archive media-oxide
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: simit-crate-media-oxide-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/simit-crates/media-oxide/*.crate
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build immutable archive rs-immicher-oxide-core
         run: |
           set -euo pipefail
