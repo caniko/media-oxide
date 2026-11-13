@@ -71,10 +71,14 @@
           perl
         ];
         buildInputs = with pkgs; [
-          ffmpeg
-          libvmaf
-          svt-av1
           openssl
+        ];
+
+        # Encoders are driven as CLIs: libjxl's cjxl and the ffmpeg build Immich
+        # itself uses, which carries SVT-AV1 and libvmaf.
+        mediaTools = with pkgs; [
+          libjxl
+          jellyfin-ffmpeg
         ];
 
         # Keep the derivation's pkg-config environment explicit. The fallback
@@ -105,6 +109,12 @@
           commonArgs
           // {
             pname = "rs-immicher-oxide";
+            nativeBuildInputs = nativeBuildInputs ++ [pkgs.makeWrapper];
+            nativeCheckInputs = mediaTools;
+            postInstall = ''
+              wrapProgram $out/bin/rs-immicher-oxide \
+                --prefix PATH : ${pkgs.lib.makeBinPath mediaTools}
+            '';
           }
         );
       in {
@@ -129,7 +139,7 @@
             inherit pkgs cross cargoConfig;
             inherit (toolchain) craneLib;
             pkgConfigDeps = buildInputs;
-            packages = nativeBuildInputs ++ buildInputs;
+            packages = nativeBuildInputs ++ buildInputs ++ mediaTools;
           })
           // {
             docs = rs-harbor.lib.mkDocsShell {

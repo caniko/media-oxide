@@ -36,8 +36,13 @@ pub struct AssetResponseDto {
     pub file_created_at: Option<String>,
     pub file_modified_at: Option<String>,
     pub is_favorite: Option<bool>,
-    pub is_archived: Option<bool>,
     pub is_trashed: Option<bool>,
+    /// Immich keeps edits (crops, rotations) apart from the original file.
+    pub is_edited: Option<bool>,
+    pub owner_id: Option<String>,
+    /// `timeline`, `archive`, `hidden` (live-photo motion parts), or `locked`.
+    pub visibility: Option<String>,
+    pub live_photo_video_id: Option<String>,
     pub exif_info: Option<ExifResponseDto>,
 }
 
@@ -45,6 +50,8 @@ pub struct AssetResponseDto {
 #[serde(rename_all = "camelCase")]
 pub struct ExifResponseDto {
     pub file_size_in_byte: Option<i64>,
+    pub description: Option<String>,
+    pub rating: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +64,7 @@ pub enum AssetType {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MetadataSearchDto {
     pub page: i32,
     pub size: i32,
@@ -70,6 +78,10 @@ pub struct MetadataSearchDto {
     pub created_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_deleted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_exif: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_stacked: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +90,7 @@ pub struct SearchResponseDto {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchAssetResponseDto {
     pub items: Vec<AssetResponseDto>,
     pub next_page: Option<String>,
@@ -97,33 +110,19 @@ pub enum AssetMediaStatus {
     Duplicate,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AssetBulkUpdateDto {
-    pub ids: Vec<String>,
+/// PUT /assets/{id} body; only set fields are sent.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAssetDto {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_favorite: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_archived: Option<bool>,
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rating: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct BulkIdsDto {
-    pub ids: Vec<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
-pub struct BulkIdResponseDto {
+pub struct UserResponseDto {
     pub id: String,
-    pub success: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AlbumResponseDto {
-    pub id: String,
-    pub album_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +210,8 @@ impl ImmichApiClient {
                 taken_before: None,
                 created_after: None,
                 with_deleted: Some(false),
+                with_exif: None,
+                with_stacked: None,
             };
 
             let result = self.search_assets(&dto).await?;
@@ -221,10 +222,6 @@ impl ImmichApiClient {
                     page = token.parse().unwrap_or(page + 1);
                 }
                 _ => break,
-            }
-
-            if result.assets.total.is_some_and(|t| all.len() >= t as usize) {
-                break;
             }
         }
 
@@ -265,14 +262,14 @@ impl ImmichApiClient {
         file_created_at: &str,
         file_modified_at: &str,
         filename: &str,
-        is_favorite: bool,
+        visibility: &str,
     ) -> ApiResult<AssetMediaResponseDto> {
         let part = multipart::Part::bytes(asset_data)
             .file_name(filename.to_string())
             .mime_str(asset_mime(filename))
             .map_err(|e| ApiError::Status(e.to_string()))?;
 
-        self.upload_asset_part(part, file_created_at, file_modified_at, is_favorite)
+        self.upload_asset_part(part, file_created_at, file_modified_at, visibility)
             .await
     }
 
@@ -284,7 +281,7 @@ impl ImmichApiClient {
         file_created_at: &str,
         file_modified_at: &str,
         filename: &str,
-        is_favorite: bool,
+        visibility: &str,
     ) -> ApiResult<AssetMediaResponseDto> {
         let file = tokio::fs::File::open(asset_path)
             .await
@@ -296,7 +293,7 @@ impl ImmichApiClient {
             .mime_str(asset_mime(filename))
             .map_err(|e| ApiError::Status(e.to_string()))?;
 
-        self.upload_asset_part(part, file_created_at, file_modified_at, is_favorite)
+        self.upload_asset_part(part, file_created_at, file_modified_at, visibility)
             .await
     }
 
@@ -305,13 +302,13 @@ impl ImmichApiClient {
         part: multipart::Part,
         file_created_at: &str,
         file_modified_at: &str,
-        is_favorite: bool,
+        visibility: &str,
     ) -> ApiResult<AssetMediaResponseDto> {
         let form = multipart::Form::new()
             .part("assetData", part)
             .text("fileCreatedAt", file_created_at.to_string())
             .text("fileModifiedAt", file_modified_at.to_string())
-            .text("isFavorite", if is_favorite { "true" } else { "false" });
+            .text("visibility", visibility.to_string());
 
         let resp = self
             .client
@@ -331,70 +328,35 @@ impl ImmichApiClient {
         }
     }
 
-    // ── Bulk update ───────────────────────────────────────────────
+    // ── Metadata ──────────────────────────────────────────────────
 
-    /// PUT /assets — bulk update asset metadata.
-    pub async fn bulk_update_assets(&self, dto: &AssetBulkUpdateDto) -> ApiResult<()> {
+    /// GET /users/me — the user that owns this API key.
+    pub async fn get_my_user(&self) -> ApiResult<UserResponseDto> {
+        let resp = self.client.get(self.url("/users/me")).send().await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// PUT /assets/copy — copy albums, shared links, stack, favorite, and the
+    /// XMP sidecar (user edits such as tags, dates, and location) from
+    /// `source_id` to `target_id`.
+    pub async fn copy_asset(&self, source_id: &str, target_id: &str) -> ApiResult<()> {
         let resp = self
             .client
-            .put(self.url("/assets"))
-            .json(dto)
+            .put(self.url("/assets/copy"))
+            .json(&serde_json::json!({ "sourceId": source_id, "targetId": target_id }))
             .send()
             .await?;
         self.check_response(resp).await?;
         Ok(())
     }
 
-    // ── Albums ────────────────────────────────────────────────────
-
-    /// GET /albums?assetId={id} — albums containing the given asset.
-    pub async fn get_albums_for_asset(&self, asset_id: &str) -> ApiResult<Vec<AlbumResponseDto>> {
+    /// PUT /assets/{id} — update asset metadata.
+    pub async fn update_asset(&self, asset_id: &str, dto: &UpdateAssetDto) -> ApiResult<()> {
         let resp = self
             .client
-            .get(self.url(&format!("/albums?assetId={asset_id}")))
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    /// PUT /albums/{id}/assets — add assets to album.
-    pub async fn add_assets_to_album(
-        &self,
-        album_id: &str,
-        asset_ids: &[String],
-    ) -> ApiResult<Vec<BulkIdResponseDto>> {
-        let resp = self
-            .client
-            .put(self.url(&format!("/albums/{album_id}/assets")))
-            .json(&BulkIdsDto {
-                ids: asset_ids.to_vec(),
-            })
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    /// PUT /albums/assets — add assets to multiple albums at once.
-    pub async fn add_assets_to_albums(
-        &self,
-        album_ids: &[String],
-        asset_ids: &[String],
-    ) -> ApiResult<()> {
-        #[derive(Serialize)]
-        struct AlbumsAddAssetsDto {
-            album_ids: Vec<String>,
-            asset_ids: Vec<String>,
-        }
-
-        let resp = self
-            .client
-            .put(self.url("/albums/assets"))
-            .json(&AlbumsAddAssetsDto {
-                album_ids: album_ids.to_vec(),
-                asset_ids: asset_ids.to_vec(),
-            })
+            .put(self.url(&format!("/assets/{asset_id}")))
+            .json(dto)
             .send()
             .await?;
         self.check_response(resp).await?;

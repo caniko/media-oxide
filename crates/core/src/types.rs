@@ -168,6 +168,9 @@ pub enum AssetOutcome {
     },
     /// Skipped (already in target format, too small, or excluded by policy).
     Skipped { asset_id: String, reason: String },
+    /// Original retained on purpose (no worthwhile saving, quality gate, or
+    /// a deterministic transcode failure). Persisted so it is not retried.
+    Kept { asset_id: String, reason: String },
     /// Failed with error.
     Failed { asset_id: String, error: String },
 }

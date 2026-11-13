@@ -15,9 +15,12 @@ include = ["Cargo.toml", "README.md", "src/**"]
 [dependencies]
 rs-immicher-oxide-core = { version = "0.1.0", path = "../core" }
 async-trait = "0.1"
-avio = { version = "0.15", features = ["pipeline"] }
+serde_json = "1"
 tracing = "0.1"
 tempfile = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [package.metadata.docs.rs]
 all-features = true

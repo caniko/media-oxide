@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 
 use rs_immicher_oxide_core::codec as codec_helpers;
 use rs_immicher_oxide_core::error::{PipelineError, Result};
@@ -101,11 +101,8 @@ impl ImmichSource {
             _ => kind,
         };
 
-        let size = dto
-            .exif_info
-            .as_ref()
-            .and_then(|e| e.file_size_in_byte)
-            .map(|s| s as u64);
+        let exif = dto.exif_info.as_ref();
+        let size = exif.and_then(|e| e.file_size_in_byte).map(|s| s as u64);
 
         Asset {
             id: dto.id,
@@ -117,9 +114,10 @@ impl ImmichSource {
             created_at: dto.file_created_at,
             checksum: dto.checksum,
             metadata: serde_json::json!({
-                "is_favorite": dto.is_favorite,
-                "is_archived": dto.is_archived,
                 "file_modified_at": dto.file_modified_at,
+                "visibility": dto.visibility,
+                "description": exif.and_then(|e| e.description.clone()),
+                "rating": exif.and_then(|e| e.rating),
             }),
         }
     }
@@ -132,6 +130,13 @@ impl Source for ImmichSource {
     }
 
     async fn discover(&self) -> Result<BoxStream<'_, Result<Asset>>> {
+        // Assets of partners are visible to this key but cannot be replaced by it.
+        let owner_id = self
+            .client
+            .get_my_user()
+            .await
+            .map_err(|e| PipelineError::Source(Box::new(e)))?
+            .id;
         let state = DiscoveryState {
             page: 1,
             page_size: 500,
@@ -139,7 +144,7 @@ impl Source for ImmichSource {
             done: false,
             seen: 0,
             yielded: 0,
-            total: None,
+            owner_id,
         };
 
         Ok(futures::stream::unfold(state, move |mut state| async move {
@@ -160,6 +165,9 @@ impl Source for ImmichSource {
                     taken_before: None,
                     created_after: self.created_after.clone(),
                     with_deleted: Some(false),
+                    with_exif: Some(true),
+                    // Stacks keep a primary asset that /assets/copy does not move.
+                    with_stacked: Some(false),
                 };
 
                 let result = match self.client.search_assets(&dto).await {
@@ -171,11 +179,20 @@ impl Source for ImmichSource {
                 };
 
                 state.seen += result.assets.items.len();
-                state.total = result.assets.total;
+                let owner_id = state.owner_id.clone();
                 let mut matched = result
                     .assets
                     .items
                     .into_iter()
+                    // Hidden assets are live-photo motion parts, live-photo stills
+                    // would lose their pairing, and edits live outside the original
+                    // file; leave all of them untouched.
+                    .filter(|dto| {
+                        dto.owner_id.as_deref() == Some(owner_id.as_str())
+                            && dto.visibility.as_deref() != Some("hidden")
+                            && dto.live_photo_video_id.is_none()
+                            && dto.is_edited != Some(true)
+                    })
                     .map(|dto| self.map_asset(dto))
                     .filter(|a| {
                         a.codec != self.target_codec && self.target_codec != MediaCodec::Unknown
@@ -205,13 +222,6 @@ impl Source for ImmichSource {
                         }
                         _ => state.done = true,
                     }
-
-                    if state
-                        .total
-                        .is_some_and(|total| state.seen >= total as usize)
-                    {
-                        state.done = true;
-                    }
                 }
             }
         })
@@ -225,12 +235,16 @@ impl Source for ImmichSource {
             .await
             .map_err(|e| PipelineError::Source(Box::new(e)))?;
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| PipelineError::Source(Box::new(e)))?;
-
-        Ok(Box::new(std::io::Cursor::new(bytes)))
+        // Spool to an unlinked temp file: videos can be larger than RAM allows.
+        let mut file = tempfile::tempfile().map_err(PipelineError::Io)?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| PipelineError::Source(Box::new(e)))?;
+            file.write_all(&chunk).map_err(PipelineError::Io)?;
+        }
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(PipelineError::Io)?;
+        Ok(Box::new(file))
     }
 }
 
@@ -241,5 +255,5 @@ struct DiscoveryState {
     done: bool,
     seen: usize,
     yielded: usize,
-    total: Option<i32>,
+    owner_id: String,
 }

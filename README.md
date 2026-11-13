@@ -38,8 +38,8 @@ media.
 | `rs-immicher-oxide` | CLI runtime in `crates/cli` |
 | `rs-immicher-oxide-core` | Pipeline traits, state, outcomes, and shared media types |
 | `rs-immicher-oxide-backend-immich` | Immich asset discovery, download, upload, metadata copy, and deletion |
-| `rs-immicher-oxide-codec-jxl` | JPEG XL image transcoder |
-| `rs-immicher-oxide-codec-av1` | SVT-AV1 video transcoder via `avio` |
+| `rs-immicher-oxide-codec-jxl` | JPEG XL image transcoder via libjxl's `cjxl` |
+| `rs-immicher-oxide-codec-av1` | SVT-AV1 video transcoder via the `ffmpeg` CLI |
 
 The repository also exports a NixOS module at
 `nixosModules.immich-convert-originals`.
@@ -48,10 +48,9 @@ The repository also exports a NixOS module at
 
 - Rust 1.93 or newer.
 - Immich server URL and API key.
-- Native build dependencies from the flake, including FFmpeg, SVT-AV1,
-  libvmaf, OpenSSL, Clang, pkg-config, and mold.
-- VAAPI-capable render device for the AV1 path when using the current video
-  transcoder configuration.
+- Native build dependencies from the flake: OpenSSL, Clang, pkg-config, and mold.
+- `cjxl` (libjxl) and an `ffmpeg`/`ffprobe` with libsvtav1 and libvmaf on
+  `PATH`; the flake package wraps both in.
 
 The easiest development environment is the Nix shell:
 
@@ -80,7 +79,7 @@ The CLI reads `IMMICH_URL` and `IMMICH_API_KEY`, or the same values can be
 passed as flags.
 
 ```sh
-export IMMICH_URL="http://localhost:2283"
+export IMMICH_URL="http://localhost:2283/api"
 export IMMICH_API_KEY="..."
 ```
 
@@ -117,7 +116,7 @@ CLI does not expose force-delete.
 Tune codecs:
 
 ```sh
-rs-immicher-oxide run --image-distance 1.0 --video-crf 20 --concurrency 2
+rs-immicher-oxide run --image-distance 1.0 --video-crf 20 --video-min-vmaf 95 --concurrency 2
 ```
 
 Poll for newly discoverable assets:
@@ -143,14 +142,28 @@ RUST_LOG=debug rs-immicher-oxide run
 
 ## Supported Media Paths
 
-Images are discovered from Immich image assets and transcoded to JPEG XL when
-the source codec is not already JXL. Supported source image formats are JPEG,
-PNG, WebP, HEIC/HEIF, AVIF, TIFF, GIF, and BMP.
+Only assets owned by the API key's user are converted. Live-photo stills and
+their hidden motion parts are left untouched so the pairing survives.
 
-Videos are discovered from Immich video assets and transcoded to AV1 in an MP4
-container when the source codec is supported by the AV1 transcoder. The current
-video path accepts H.264, H.265, AV1, and VP9 inputs, uses VAAPI decode, SVT-AV1
-encode, Opus audio, and MP4 faststart output.
+Images: JPEG and PNG are encoded by libjxl's `cjxl` at butteraugli distance
+1.0 (visually lossless). `cjxl` carries Exif, XMP, and ICC data and the
+orientation, so dates, GPS, camera data, colour, and rotation survive. HEIC,
+AVIF, WebP, GIF, TIFF, and RAW are left alone: they are already efficient,
+cannot be read by `cjxl`, or carry gain maps, depth, or animation.
+
+Videos: H.264, HEVC, and VP9 are encoded by `ffmpeg` with SVT-AV1 at 10-bit,
+CRF 20 and the perceptual (VQ) tune. HDR colour tags, creation time, and the
+Apple location/make/model keys are kept; the display rotation is applied to the
+pixels. Audio becomes 192 kb/s Opus. Sources already in AV1 are kept.
+
+Every replacement must be at most 90% of the original's size, and every video
+encode must reach a mean VMAF of 95 (`--video-min-vmaf`) against its source.
+An original that fails either check, or that the encoder cannot read, is kept
+and recorded in the state file so it is not retried.
+
+After upload, Immich's `PUT /assets/copy` moves albums, shared links, stacks,
+favorite state, and the XMP sidecar (user edits) to the replacement; archive
+visibility, description, and rating are set too. Faces are detected afresh.
 
 ## NixOS Module
 
@@ -172,11 +185,10 @@ Example:
           services.immich-convert-originals = {
             enable = true;
             package = rs-immicher-oxide.packages.x86_64-linux.default;
-            immichUrl = "http://localhost:2283";
+            immichUrl = "http://localhost:2283/api";
             apiKeyFile = "/run/secrets/immich-convert-api-key";
             writeMode = "dry-run";
             pollInterval = "5min";
-            concurrency = 1;
             assetIds = [];
             statePath = "/var/lib/rs-immicher-oxide/state.jsonl";
             manifestPath = "/var/lib/rs-immicher-oxide/manifest.jsonl";

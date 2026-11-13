@@ -18,6 +18,10 @@ pub enum PipelineError {
         transcoder: String,
     },
 
+    /// The transcoder decided the original must be kept unchanged.
+    #[error("keep original: {0}")]
+    Keep(String),
+
     #[error("state error: {0}")]
     State(#[source] Box<dyn std::error::Error + Send + Sync>),
 
