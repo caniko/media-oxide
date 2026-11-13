@@ -1,0 +1,33 @@
+[package]
+name = "media-oxide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JPEG XL encoding, container, and decoding helpers for media pipelines."
+documentation = "https://docs.rs/media-oxide"
+readme = "README.md"
+keywords = ["jpeg-xl", "jxl", "image", "transcode", "media"]
+categories = ["multimedia::images", "encoding"]
+include = ["Cargo.toml", "README.md", "src/**"]
+
+[features]
+# JPEG XL decoding, validation, dimensions, and preview cuts. The default
+# feature set only shells out to `cjxl` and parses the container.
+decode = ["dep:image", "dep:jxl-frame", "dep:jxl-oxide"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, optional = true }
+# Exact pins: the frame/TOC API and the preview cut rule are tied to them.
+jxl-frame = { version = "=0.13.3", optional = true }
+jxl-oxide = { version = "=0.12.6", optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+png = "=0.18.1"
+tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
