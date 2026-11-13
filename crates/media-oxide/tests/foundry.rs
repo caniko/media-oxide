@@ -229,6 +229,17 @@ fn unsafe_svg_is_rejected() {
         "<svg><a href=\"javascript:alert(1)\"/></svg>"
     ));
     assert!(!svg_is_safe("<svg><foreignObject/></svg>"));
+    // Bypasses a naive denylist misses.
+    assert!(!svg_is_safe("<svg onload = \"alert(1)\"/>"));
+    assert!(!svg_is_safe("<svg onload\n=\"alert(1)\"/>"));
+    assert!(!svg_is_safe(
+        "<s:svg xmlns:s=\"http://www.w3.org/2000/svg\"><s:script>alert(1)</s:script></s:svg>"
+    ));
+    assert!(!svg_is_safe("<svg><a href=\"java&#x73;cript:alert(1)\"/></svg>"));
+    assert!(!svg_is_safe("<svg><a href=\"java\tscript:alert(1)\"/></svg>"));
+    assert!(!svg_is_safe(
+        "<!DOCTYPE svg [<!ENTITY js \"javascript:\">]><svg><a href=\"&js;alert(1)\"/></svg>"
+    ));
     assert!(svg_is_safe(
         "<svg width=\"1\" height=\"1\"><rect font-size=\"2\"/></svg>"
     ));
@@ -240,6 +251,8 @@ fn upload_names_are_normalized_and_kind_appropriate() {
     assert!(allowed_upload(AssetKind::Artwork, "guard.webm"));
     assert!(allowed_upload(AssetKind::Audio, "tavern-loop.ogg"));
     assert!(allowed_upload(AssetKind::Audio, "tavern.webm"));
+    assert!(allowed_upload(AssetKind::Audio, "tavern.m4a"));
+    assert!(allowed_upload(AssetKind::Audio, "tavern.aac"));
     assert!(!allowed_upload(AssetKind::Token, "../x.webp"));
     assert!(!allowed_upload(AssetKind::Token, "Upper.webp"));
     assert!(!allowed_upload(AssetKind::Token, "a.exe"));
@@ -256,7 +269,25 @@ fn magic_bytes_must_match_the_extension() {
     assert!(sniff_matches("a.webp", b"RIFF\0\0\0\0WEBPVP8 "));
     assert!(sniff_matches("a.jpg", b"\xff\xd8\xff\xe0"));
     assert!(sniff_matches("a.mp4", b"\0\0\0\x18ftypisom"));
-    assert!(sniff_matches("a.webm", b"\x1a\x45\xdf\xa3"));
+    assert!(sniff_matches(
+        "a.webm",
+        b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm"
+    ));
+    assert!(!sniff_matches(
+        "a.webm",
+        b"\x1a\x45\xdf\xa3\xa3\x42\x82\x88matroska"
+    ));
+    assert!(sniff_matches("a.avif", b"\0\0\0\x1cftypavif"));
+    assert!(!sniff_matches("a.avif", b"\0\0\0\x18ftypisom"));
+    assert!(!sniff_matches("a.mp4", b"\0\0\0\x1cftypavif"));
+    assert!(sniff_matches("a.m4a", b"\0\0\0\x20ftypM4A "));
+    assert!(sniff_matches("a.aac", &[0xff, 0xf1, 0x50]));
+    assert!(sniff_matches(
+        "a.svg",
+        b"\xef\xbb\xbf<?xml version=\"1.0\"?>\n<!-- icon -->\n<svg width=\"1\">"
+    ));
+    assert!(!sniff_matches("a.svg", b"<html><svg/></html>"));
+    assert!(!sniff_matches("a.svg", b"hello <svg"));
     assert!(sniff_matches("a.ogg", b"OggS\0\x02"));
     assert!(sniff_matches("a.flac", b"fLaC\0\0"));
     assert!(sniff_matches("a.mp3", b"ID3\x04"));
@@ -328,4 +359,11 @@ fn convert_writes_sized_webp_with_real_ffmpeg() {
 
     let again = convert(&input, Some(AssetKind::Token), &options(), directory.path());
     assert!(matches!(again, Err(Error::Exists(_))), "{again:?}");
+    // Neither the successes nor the refused run leave temp files behind.
+    let leftovers: Vec<_> = std::fs::read_dir(directory.path().join("tokens"))
+        .expect("tokens dir")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().contains(".partial."))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

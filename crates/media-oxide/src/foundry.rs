@@ -287,6 +287,8 @@ pub fn plan(
             format!("{stem}.ogg"),
             Action::Ffmpeg(audio_arguments(opts)),
         ),
+        // `.oga` is Ogg audio; Foundry and the upload check know it as `.ogg`.
+        Family::Audio if extension == "oga" => (format!("{stem}.ogg"), Action::Copy),
         Family::Audio => (format!("{stem}.{extension}"), Action::Copy),
     };
     Ok(Plan {
@@ -319,9 +321,12 @@ pub fn convert(
     if output.exists() {
         return Err(Error::Exists(output));
     }
+    // Every action writes an exclusively created temp file; only a complete
+    // one is published, and publishing never replaces an existing asset.
+    let staged = Staged::create(&output)?;
     match &planned.action {
         Action::Copy => {
-            std::fs::copy(input, &output)?;
+            std::fs::copy(input, &staged.0)?;
         }
         Action::Svg => {
             let text = std::fs::read_to_string(input)?;
@@ -331,10 +336,13 @@ pub fn convert(
                     input.display()
                 )));
             }
-            std::fs::write(&output, svg_with_size(&text)?)?;
+            std::fs::write(&staged.0, svg_with_size(&text)?)?;
         }
-        Action::Ffmpeg(arguments) => run_ffmpeg(input, arguments, &output)?,
+        Action::Ffmpeg(arguments) => {
+            run_ffmpeg(input, &alpha_decoder(input)?, arguments, &staged.0)?
+        }
     }
+    staged.publish(&output)?;
     Ok(output)
 }
 
@@ -358,16 +366,64 @@ pub fn sniff_matches(file_name: &str, head: &[u8]) -> bool {
         "webp" => magic_at(head, 0, b"RIFF") && magic_at(head, 8, b"WEBP"),
         "png" => magic_at(head, 0, b"\x89PNG\r\n\x1a\n"),
         "jpg" | "jpeg" => magic_at(head, 0, b"\xff\xd8\xff"),
-        "avif" | "mp4" | "m4v" => magic_at(head, 4, b"ftyp"),
-        "webm" => magic_at(head, 0, b"\x1a\x45\xdf\xa3"),
+        "avif" => magic_at(head, 4, b"ftyp") && avif_brand(head),
+        "mp4" | "m4v" | "m4a" => magic_at(head, 4, b"ftyp") && !avif_brand(head),
+        // EBML header whose DocType is `webm`, not plain Matroska.
+        "webm" => {
+            magic_at(head, 0, b"\x1a\x45\xdf\xa3")
+                && head[..head.len().min(64)]
+                    .windows(4)
+                    .any(|window| window == b"webm")
+        }
         "ogg" | "opus" => magic_at(head, 0, b"OggS"),
         "flac" => magic_at(head, 0, b"fLaC"),
         "mp3" => {
             magic_at(head, 0, b"ID3")
                 || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0)
         }
-        "svg" => std::str::from_utf8(head).is_ok_and(|text| text.contains("<svg")),
+        // ADTS frame sync (layer bits zero) or an ADIF header.
+        "aac" => {
+            magic_at(head, 0, b"ADIF")
+                || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xf6) == 0xf0)
+        }
+        "svg" => svg_root_first(head),
         _ => false,
+    }
+}
+
+fn avif_brand(head: &[u8]) -> bool {
+    magic_at(head, 8, b"avif") || magic_at(head, 8, b"avis")
+}
+
+/// Whether the first element after the prolog (BOM, XML declaration,
+/// comments, whitespace) is `<svg`. Only the valid UTF-8 prefix of `head`
+/// counts, so a head cut inside a character still sniffs.
+fn svg_root_first(head: &[u8]) -> bool {
+    let valid = match std::str::from_utf8(head) {
+        Ok(text) => text,
+        Err(error) => match std::str::from_utf8(&head[..error.valid_up_to()]) {
+            Ok(text) => text,
+            Err(_) => return false,
+        },
+    };
+    let mut rest = valid.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("<?xml") {
+            match after.find("?>") {
+                Some(end) => rest = after[end + 2..].trim_start(),
+                None => return false,
+            }
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            match after.find("-->") {
+                Some(end) => rest = after[end + 3..].trim_start(),
+                None => return false,
+            }
+        } else {
+            return rest.starts_with("<svg")
+                && rest[4..].starts_with(|character: char| {
+                    character.is_ascii_whitespace() || character == '>' || character == '/'
+                });
+        }
     }
 }
 
@@ -377,13 +433,28 @@ pub fn sniff_matches(file_name: &str, head: &[u8]) -> bool {
 /// untrusted authors must render.
 pub fn svg_is_safe(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    if ["<script", "javascript:", "<foreignobject"]
+    // Character references and DTD entities can spell any blocked word, and
+    // browsers drop whitespace inside URL schemes, so refuse the former and
+    // match schemes with whitespace removed.
+    let compact: String = lower
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    if ["&#", "<!entity", "foreignobject"]
         .iter()
         .any(|blocked| lower.contains(blocked))
+        || compact.contains("javascript:")
     {
         return false;
     }
-    !event_attribute(&lower)
+    // `<script` in any namespace (`<svg:script`).
+    let script = lower.match_indices("script").any(|(index, _)| {
+        matches!(
+            lower.as_bytes().get(index.wrapping_sub(1)),
+            Some(b'<' | b':')
+        )
+    });
+    !script && !event_attribute(&lower)
 }
 
 /// Add `width`/`height` to an SVG root that only declares a `viewBox`.
@@ -550,6 +621,10 @@ fn video_arguments() -> Vec<String> {
         "32",
         "-b:v",
         "4M",
+        "-maxrate",
+        "4M",
+        "-bufsize",
+        "8M",
         "-row-mt",
         "1",
         "-fpsmax",
@@ -581,7 +656,10 @@ fn audio_arguments(opts: &Options) -> Vec<String> {
 
 fn upload_extension(kind: AssetKind, extension: &str) -> bool {
     match kind {
-        AssetKind::Audio => matches!(extension, "ogg" | "opus" | "mp3" | "flac" | "webm"),
+        AssetKind::Audio => matches!(
+            extension,
+            "ogg" | "opus" | "mp3" | "flac" | "webm" | "m4a" | "aac"
+        ),
         _ => matches!(
             extension,
             "webp" | "svg" | "png" | "jpg" | "jpeg" | "avif" | "webm" | "mp4" | "m4v"
@@ -611,7 +689,7 @@ fn event_attribute(lower: &str) -> bool {
         }
         let rest = &lower[index + 2..];
         let letters = rest.bytes().take_while(u8::is_ascii_lowercase).count();
-        letters > 0 && rest.as_bytes().get(letters) == Some(&b'=')
+        letters > 0 && rest[letters..].trim_start().starts_with('=')
     })
 }
 
@@ -694,17 +772,24 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<Option<&'a str>> {
 }
 
 fn probe_dimensions(input: &Path) -> Result<Probe> {
+    let text = ffprobe(input, "stream=width,height")?;
+    let mut fields = text.trim().split(',');
+    let width = fields.next().and_then(|value| value.trim().parse().ok());
+    let height = fields.next().and_then(|value| value.trim().parse().ok());
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Ok(Probe { width, height }),
+        _ => Err(Error::Invalid(format!(
+            "ffprobe reported no usable dimensions for {}",
+            input.display()
+        ))),
+    }
+}
+
+/// One `-show_entries` query on the first video stream, as CSV text.
+fn ffprobe(input: &Path, entries: &str) -> Result<String> {
     let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0",
-        ])
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", entries])
+        .args(["-of", "csv=p=0"])
         .arg(input)
         .stdin(std::process::Stdio::null())
         .output()
@@ -719,27 +804,18 @@ fn probe_dimensions(input: &Path) -> Result<Probe> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut fields = text.trim().split(',');
-    let width = fields.next().and_then(|value| value.trim().parse().ok());
-    let height = fields.next().and_then(|value| value.trim().parse().ok());
-    match (width, height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => Ok(Probe { width, height }),
-        _ => Err(Error::Invalid(format!(
-            "ffprobe reported no usable dimensions for {}",
-            input.display()
-        ))),
-    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn run_ffmpeg(input: &Path, arguments: &[String], output: &Path) -> Result<()> {
-    let partial = partial_path(output);
+fn run_ffmpeg(input: &Path, decoder: &[&str], arguments: &[String], output: &Path) -> Result<()> {
+    // `-y`: the exclusively created temp file is ours to overwrite.
     let result = std::process::Command::new("ffmpeg")
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-n"])
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+        .args(decoder)
         .arg("-i")
         .arg(input)
         .args(arguments)
-        .arg(&partial)
+        .arg(output)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|source| Error::Spawn {
@@ -747,26 +823,75 @@ fn run_ffmpeg(input: &Path, arguments: &[String], output: &Path) -> Result<()> {
             source,
         })?;
     if !result.status.success() {
-        let _ = std::fs::remove_file(&partial);
         return Err(Error::Tool {
             program: "ffmpeg",
             status: result.status,
             stderr: String::from_utf8_lossy(&result.stderr).trim().to_string(),
         });
     }
-    std::fs::rename(&partial, output)?;
     Ok(())
 }
 
-/// `.<name>.partial.<ext>` next to `output`; ffmpeg picks the muxer by
-/// extension, so the temp file keeps it.
-fn partial_path(output: &Path) -> PathBuf {
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("asset");
-    match name.rsplit_once('.') {
-        Some((stem, extension)) => output.with_file_name(format!(".{stem}.partial.{extension}")),
-        None => output.with_file_name(format!(".{name}.partial")),
+/// FFmpeg's native VP8/VP9 decoders drop the alpha side channel, so a
+/// transparent WebM input must be decoded by libvpx to stay transparent.
+fn alpha_decoder(input: &Path) -> Result<Vec<&'static str>> {
+    let extension = extension_of(input)?;
+    if !matches!(extension.as_str(), "webm" | "mkv") {
+        return Ok(Vec::new());
+    }
+    let codec = ffprobe(input, "stream=codec_name")?;
+    Ok(match codec.trim() {
+        "vp9" => vec!["-c:v", "libvpx-vp9"],
+        "vp8" => vec!["-c:v", "libvpx"],
+        _ => Vec::new(),
+    })
+}
+
+/// An exclusively created temp file next to the output, removed on drop.
+struct Staged(PathBuf);
+
+impl Staged {
+    /// `.<stem>.<pid>-<n>.partial.<ext>`: ffmpeg picks the muxer by
+    /// extension, and `create_new` makes the path this invocation's alone.
+    fn create(output: &Path) -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("asset");
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((name, "tmp"));
+        loop {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = output.with_file_name(format!(
+                ".{stem}.{}-{n}.partial.{extension}",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Publish without replacement: a hard link fails if `output` exists.
+    fn publish(self, output: &Path) -> Result<()> {
+        match std::fs::hard_link(&self.0, output) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::Exists(output.to_path_buf()))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
