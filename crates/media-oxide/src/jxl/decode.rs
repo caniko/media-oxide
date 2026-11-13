@@ -617,6 +617,21 @@ mod tests {
     }
 
     #[test]
+    fn two_frame_layout_cuts_at_the_end_of_the_preview_frame() {
+        // cjxl 0.12.0 `-d 1 -e 7 -p` of a 400x300 RGB image: a progressive
+        // preview frame ending at byte 4900, where the keyframe starts. It is
+        // committed because the locked libjxl 0.11.2 encodes the synthetic
+        // fixtures as one progressive keyframe, which would leave this path
+        // untested. Small enough that its preview frame is one section, so
+        // both cuts end the frame; a cut past 4900 reads into the keyframe.
+        let bytes = include_bytes!("../../tests/fixtures/two-frame-400x300.jxl");
+        let cuts = cuts(bytes);
+        assert_eq!(cuts.preview, Some(4900));
+        assert_eq!(cuts.tile, Some(4900));
+        assert_eq!(validate(bytes, 16_777_216).expect("validate"), (400, 300));
+    }
+
+    #[test]
     fn decode_and_validate_enforce_the_pixel_budget() {
         let dir = tempfile::tempdir().expect("temp");
         let input = dir.path().join("plain.png");
@@ -628,7 +643,7 @@ mod tests {
         let bytes = std::fs::read(&output).expect("read");
         for error in [
             decode(&bytes, 1).expect_err("decode budget"),
-            validate(&bytes, 1).err().expect("validate budget"),
+            validate(&bytes, 1).expect_err("validate budget"),
         ] {
             assert!(error.to_string().contains("-pixel budget"), "{error}");
         }
