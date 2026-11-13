@@ -14,6 +14,7 @@ include = ["Cargo.toml", "README.md", "src/**"]
 
 [dependencies]
 rs-immicher-oxide-core = { version = "0.1.0", path = "../core" }
+media-oxide = { version = "0.1.0", path = "../media-oxide" }
 async-trait = "0.1"
 tempfile = "3"
 

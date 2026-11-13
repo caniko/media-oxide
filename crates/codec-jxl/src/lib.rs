@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use std::io::{Cursor, Read};
-use std::process::Command;
 
+use media_oxide::jxl::{encode_file, EncodeOptions};
 use rs_immicher_oxide_core::error::{PipelineError, Result};
-use rs_immicher_oxide_core::transcoder::{require_saving, run_tool, Transcoder};
+use rs_immicher_oxide_core::transcoder::{require_saving, Transcoder};
 use rs_immicher_oxide_core::types::{
     Asset, MediaCodec, MediaKind, TranscodeStats, TranscodedAsset, TranscodedPayload,
 };
@@ -51,16 +51,16 @@ impl JxlTranscoder {
         let output = tmp.path().join("output.jxl");
         std::fs::write(&input, data).map_err(PipelineError::Io)?;
 
-        let lossless_jpeg = if self.distance == 0.0 { "1" } else { "0" };
-        run_tool(
-            Command::new("cjxl")
-                .arg(&input)
-                .arg(&output)
-                .arg(format!("--distance={}", self.distance))
-                .arg(format!("--effort={}", self.effort))
-                .arg(format!("--lossless_jpeg={lossless_jpeg}"))
-                .arg("--quiet"),
-        )?;
+        encode_file(
+            &input,
+            &output,
+            &EncodeOptions {
+                distance: self.distance,
+                effort: self.effort,
+                progressive: false,
+            },
+        )
+        .map_err(|error| PipelineError::Transcoder(Box::new(error)))?;
         std::fs::read(&output).map_err(PipelineError::Io)
     }
 }
