@@ -428,7 +428,10 @@ fn svg_root_first(head: &[u8]) -> bool {
                 Some(end) => rest = after[end + 3..].trim_start(),
                 None => return false,
             }
-        } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("<!doctype") {
+        } else if rest
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
+        {
             // An internal subset ends at `]>`; `svg_is_safe` refuses entities.
             let subset = rest.find('[').is_some_and(|open| rest.find('>') > Some(open));
             let close = if subset { "]>" } else { ">" };

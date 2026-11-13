@@ -295,6 +295,9 @@ fn magic_bytes_must_match_the_extension() {
         b"<?xml version=\"1.0\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg width=\"1\">"
     ));
     assert!(!sniff_matches("a.svg", b"<html><svg/></html>"));
+    // Multi-byte text right after the root must not panic the sniffer.
+    assert!(sniff_matches("a.svg", "<svg>日本語</svg>".as_bytes()));
+    assert!(!sniff_matches("a.svg", "<!doc日本語".as_bytes()));
     assert!(!sniff_matches("a.svg", b"hello <svg"));
     assert!(sniff_matches("a.ogg", b"OggS\0\x02"));
     assert!(sniff_matches("a.flac", b"fLaC\0\0"));
