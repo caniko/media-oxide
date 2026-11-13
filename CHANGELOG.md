@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Images are encoded by libjxl's `cjxl` (Exif, XMP, ICC, and orientation kept)
+  and only JPEG and PNG are converted; videos are encoded by the `ffmpeg` CLI
+  with SVT-AV1 10-bit and gated by a per-video VMAF floor (`--video-min-vmaf`,
+  default 95). The `avio` stack and the vendored `ff-pipeline` are gone.
+- Originals are kept, and recorded as `Kept`, when the replacement is not at
+  most 90% of their size, fails the VMAF floor, is already AV1, or cannot be
+  decoded; partial successes are recorded too, so neither is redone each poll.
+- Metadata moves through Immich's `PUT /assets/copy` (albums, shared links,
+  stack, favorite, sidecar); uploads keep archive visibility, and description
+  and rating are re-applied.
+
+### Fixed
+
+- Discovery followed `next_page` instead of Immich's `nextPage` and stopped at
+  `total`, which is the page length, so only the first 500 assets were seen.
+- Search filters were sent in snake_case and silently ignored.
+- Partner assets, hidden live-photo motion parts, and live-photo stills are no
+  longer converted.
+- Originals and verification downloads stream to disk instead of RAM; the
+  verification compares the downloaded byte count with the upload.
+- The NixOS module passes its CRF, preset, and distance options to the CLI,
+  defaults to the `/api` base URL, spools to `/var/tmp`, and runs at idle
+  priority; the unused VAAPI, work-directory, encoder-enum, and concurrency
+  options are removed.
+
 ### Added
 
 - `TranscodedPayload` enum with `Reader` and `File` variants for memory-efficient

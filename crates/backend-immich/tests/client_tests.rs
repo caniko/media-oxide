@@ -1,8 +1,6 @@
-use rs_immicher_oxide_backend_immich::client::{
-    AssetBulkUpdateDto, AssetType, ImmichApiClient, MetadataSearchDto,
-};
+use rs_immicher_oxide_backend_immich::client::{AssetType, ImmichApiClient, MetadataSearchDto};
 use rs_immicher_oxide_backend_immich::ImmichConfig;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_client(mock: &MockServer) -> ImmichApiClient {
@@ -67,6 +65,8 @@ async fn search_assets_returns_items() {
             taken_before: None,
             created_after: None,
             with_deleted: Some(false),
+            with_exif: None,
+            with_stacked: None,
         })
         .await;
 
@@ -144,7 +144,7 @@ async fn upload_asset_returns_id() {
             "2024-01-01T00:00:00.000Z",
             "2024-01-01T00:00:00.000Z",
             "output.mp4",
-            false,
+            "timeline",
         )
         .await;
 
@@ -154,84 +154,23 @@ async fn upload_asset_returns_id() {
 }
 
 #[tokio::test]
-async fn bulk_update_assets_succeeds() {
+async fn copy_asset_sends_camel_case_ids() {
     let mock = MockServer::start().await;
 
     Mock::given(method("PUT"))
-        .and(path("/assets"))
+        .and(path("/assets/copy"))
+        .and(body_partial_json(
+            serde_json::json!({"sourceId": "old", "targetId": "new"}),
+        ))
         .respond_with(ResponseTemplate::new(204))
+        .expect(1)
         .mount(&mock)
         .await;
 
-    let client = make_client(&mock);
-    let result = client
-        .bulk_update_assets(&AssetBulkUpdateDto {
-            ids: vec!["asset-1".into()],
-            is_favorite: Some(true),
-            is_archived: Some(false),
-            rating: None,
-        })
-        .await;
-
-    assert!(result.is_ok(), "bulk update failed: {:?}", result.err());
-}
-
-#[tokio::test]
-async fn get_albums_for_asset_returns_albums() {
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/albums"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "id": "album-1",
-                "albumName": "Vacation",
-                "albumThumbnailAssetId": null,
-                "albumUsers": [],
-                "assetCount": 1,
-                "createdAt": "2024-01-01T00:00:00.000Z",
-                "description": "",
-                "hasSharedLink": false,
-                "isActivityEnabled": true,
-                "shared": false,
-                "updatedAt": "2024-01-01T00:00:00.000Z"
-            }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = make_client(&mock);
-    let albums = client
-        .get_albums_for_asset("asset-1")
+    make_client(&mock)
+        .copy_asset("old", "new")
         .await
-        .expect("get_albums should succeed");
-
-    assert_eq!(albums.len(), 1);
-    assert_eq!(albums[0].id, "album-1");
-    assert_eq!(albums[0].album_name, "Vacation");
-}
-
-#[tokio::test]
-async fn add_assets_to_album_succeeds() {
-    let mock = MockServer::start().await;
-
-    Mock::given(method("PUT"))
-        .and(path("/albums/album-1/assets"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!([{"id": "asset-1", "success": true}])),
-        )
-        .mount(&mock)
-        .await;
-
-    let client = make_client(&mock);
-    let result = client
-        .add_assets_to_album("album-1", &["asset-1".into()])
-        .await;
-
-    assert!(result.is_ok(), "add to album failed: {:?}", result.err());
-    let items = result.unwrap();
-    assert!(items[0].success);
+        .expect("copy should succeed");
 }
 
 #[tokio::test]
@@ -270,6 +209,8 @@ async fn unauthorized_returns_error() {
             taken_before: None,
             created_after: None,
             with_deleted: None,
+            with_exif: None,
+            with_stacked: None,
         })
         .await;
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{PipelineError, Result};
 use crate::sink::Sink;
 use crate::source::Source;
 use crate::transcoder::Transcoder;
@@ -135,7 +135,7 @@ impl PipelineSummary {
         match outcome {
             AssetOutcome::Success { .. } => self.succeeded += 1,
             AssetOutcome::PartialSuccess { .. } => self.partial += 1,
-            AssetOutcome::Skipped { .. } => self.skipped += 1,
+            AssetOutcome::Skipped { .. } | AssetOutcome::Kept { .. } => self.skipped += 1,
             AssetOutcome::Failed { .. } => self.failed += 1,
         }
     }
@@ -176,7 +176,14 @@ async fn process_asset(
         process_opened_asset(&*source, &*transcoder, &*sink, write_mode, &asset).await
     };
 
-    if matches!(outcome, AssetOutcome::Success { .. }) {
+    // A partial success already uploaded a replacement and a kept original was
+    // judged on purpose; redoing either on the next poll duplicates work.
+    if matches!(
+        outcome,
+        AssetOutcome::Success { .. }
+            | AssetOutcome::PartialSuccess { .. }
+            | AssetOutcome::Kept { .. }
+    ) {
         if let Some(ref state) = state {
             let _ = state.record(&asset.id, &outcome).await;
         }
@@ -204,6 +211,20 @@ async fn process_opened_asset(
 
     let mut transcoded = match transcoder.transcode(input, asset).await {
         Ok(t) => t,
+        // Policy decisions and decode/encode failures are deterministic:
+        // keep the original instead of re-encoding it on every poll.
+        Err(PipelineError::Keep(reason)) => {
+            return AssetOutcome::Kept {
+                asset_id: asset.id.clone(),
+                reason,
+            };
+        }
+        Err(e @ PipelineError::Transcoder(_)) => {
+            return AssetOutcome::Kept {
+                asset_id: asset.id.clone(),
+                reason: format!("transcode failed: {e}"),
+            };
+        }
         Err(e) => {
             return AssetOutcome::Failed {
                 asset_id: asset.id.clone(),
@@ -630,18 +651,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_transcode_failure() {
+    async fn transcode_failure_keeps_original_and_is_not_retried() {
         let asset = make_asset("a1", MediaCodec::Jpeg, MediaKind::Image);
         let source = MockSource::new(vec![asset]);
         let transcoder =
             MockTranscoder::new(&[MediaCodec::Jpeg], MediaCodec::Jxl, MediaKind::Image)
                 .with_failure();
         let sink = MockSink::new();
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = RecordingState::new(std::sync::Arc::clone(&records));
         let mut pipeline = Pipeline::new(Box::new(source), Box::new(transcoder), Box::new(sink))
+            .with_state(Box::new(state))
             .with_write_mode(WriteMode::UploadOnly);
 
-        let summary = pipeline.run(|_| {}).await.unwrap();
-        assert_eq!(summary.failed, 1);
+        let mut kept = false;
+        let summary = pipeline
+            .run(|o| kept = matches!(o, AssetOutcome::Kept { .. }))
+            .await
+            .unwrap();
+        assert!(kept);
+        assert_eq!((summary.failed, summary.skipped), (0, 1));
+        assert_eq!(records.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -754,6 +784,7 @@ mod tests {
                     AssetOutcome::Success { asset_id, .. }
                     | AssetOutcome::PartialSuccess { asset_id, .. }
                     | AssetOutcome::Skipped { asset_id, .. }
+                    | AssetOutcome::Kept { asset_id, .. }
                     | AssetOutcome::Failed { asset_id, .. } => asset_id,
                 };
                 outcomes.lock().unwrap().push(asset_id);

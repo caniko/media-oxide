@@ -59,6 +59,8 @@ struct RuntimeConfig {
     immich_url: String,
     api_key: String,
     video_crf: u32,
+    video_preset: u32,
+    video_min_vmaf: f64,
     image_distance: f32,
     concurrency: usize,
     write_mode: WriteMode,
@@ -128,7 +130,9 @@ impl RuntimeConfig {
         let source = self
             .apply_filters(ImmichSource::new(immich.clone(), MediaCodec::Av1))
             .with_videos_only();
-        let transcoder = SvtAv1UhqTranscoder::new(self.video_crf);
+        let transcoder = SvtAv1UhqTranscoder::new(self.video_crf)
+            .with_preset(self.video_preset)
+            .with_min_vmaf(self.video_min_vmaf);
         let sink = ImmichSink::new(immich);
         (source, transcoder, sink)
     }
@@ -139,7 +143,7 @@ enum Command {
     /// One-shot conversion: discover existing assets, transcode, upload.
     #[command(alias = "convert")]
     Run {
-        /// Immich server URL.
+        /// Immich API base URL, including `/api`.
         #[arg(long, env = "IMMICH_URL")]
         immich_url: String,
 
@@ -179,6 +183,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         video_crf: u32,
 
+        /// SVT-AV1 preset (0-13, lower = slower and smaller).
+        #[arg(long, default_value_t = 6)]
+        video_preset: u32,
+
+        /// Keep the original when the encode scores a lower mean VMAF.
+        #[arg(long, default_value_t = 95.0)]
+        video_min_vmaf: f64,
+
         /// JXL butteraugli distance (0 = lossless, 1.0 = visually lossless).
         #[arg(long, default_value_t = 1.0)]
         image_distance: f32,
@@ -202,7 +214,7 @@ enum Command {
 
     /// Daemon mode: poll for new assets and process them.
     Watch {
-        /// Immich server URL.
+        /// Immich API base URL, including `/api`.
         #[arg(long, env = "IMMICH_URL")]
         immich_url: String,
 
@@ -234,6 +246,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         video_crf: u32,
 
+        /// SVT-AV1 preset (0-13, lower = slower and smaller).
+        #[arg(long, default_value_t = 6)]
+        video_preset: u32,
+
+        /// Keep the original when the encode scores a lower mean VMAF.
+        #[arg(long, default_value_t = 95.0)]
+        video_min_vmaf: f64,
+
         /// JXL butteraugli distance.
         #[arg(long, default_value_t = 1.0)]
         image_distance: f32,
@@ -261,7 +281,7 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:8088")]
         bind: String,
 
-        /// Immich server URL.
+        /// Immich API base URL, including `/api`.
         #[arg(long, env = "IMMICH_URL")]
         immich_url: String,
 
@@ -309,6 +329,8 @@ async fn main() -> anyhow::Result<()> {
             created_after,
             taken_after,
             video_crf,
+            video_preset,
+            video_min_vmaf,
             image_distance,
             write_mode,
             state_path,
@@ -323,6 +345,8 @@ async fn main() -> anyhow::Result<()> {
                 immich_url,
                 api_key: resolve_api_key(api_key, api_key_file)?,
                 video_crf,
+                video_preset,
+                video_min_vmaf,
                 image_distance,
                 concurrency,
                 write_mode: write_mode.into(),
@@ -369,6 +393,8 @@ async fn main() -> anyhow::Result<()> {
             created_after,
             taken_after,
             video_crf,
+            video_preset,
+            video_min_vmaf,
             image_distance,
             interval,
             write_mode,
@@ -379,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
                 immich_url,
                 api_key: resolve_api_key(api_key, api_key_file)?,
                 video_crf,
+                video_preset,
+                video_min_vmaf,
                 image_distance,
                 concurrency: 1,
                 write_mode: write_mode.into(),
@@ -433,6 +461,9 @@ async fn main() -> anyhow::Result<()> {
                 immich_url,
                 api_key: resolve_api_key(api_key, api_key_file)?,
                 video_crf,
+                // serve is dry-run only; encoder settings are never used.
+                video_preset: 6,
+                video_min_vmaf: 95.0,
                 image_distance,
                 concurrency: 2,
                 write_mode,
@@ -514,6 +545,9 @@ fn log_outcome(outcome: &AssetOutcome) {
         }
         AssetOutcome::Skipped { asset_id, reason } => {
             tracing::debug!("{} skipped: {}", asset_id, reason);
+        }
+        AssetOutcome::Kept { asset_id, reason } => {
+            tracing::info!("{} kept original: {}", asset_id, reason);
         }
         AssetOutcome::Failed { asset_id, error } => {
             tracing::error!("{} failed: {}", asset_id, error);
@@ -688,7 +722,10 @@ impl JsonlStateStore {
                     continue;
                 }
                 let record: StateRecord = serde_json::from_str(&line)?;
-                if matches!(record.outcome, AssetOutcome::Success { .. }) {
+                if !matches!(
+                    record.outcome,
+                    AssetOutcome::Skipped { .. } | AssetOutcome::Failed { .. }
+                ) {
                     completed.insert(record.original_id);
                 }
             }
@@ -706,8 +743,12 @@ impl JsonlStateStore {
 #[async_trait]
 impl StateStore for JsonlStateStore {
     async fn record(&self, asset_id: &str, outcome: &AssetOutcome) -> PipelineResult<()> {
-        let AssetOutcome::Success { new_id, .. } = outcome else {
-            return Ok(());
+        let new_id = match outcome {
+            AssetOutcome::Success { new_id, .. } | AssetOutcome::PartialSuccess { new_id, .. } => {
+                new_id.clone()
+            }
+            AssetOutcome::Kept { .. } => String::new(),
+            AssetOutcome::Skipped { .. } | AssetOutcome::Failed { .. } => return Ok(()),
         };
 
         {
@@ -720,7 +761,7 @@ impl StateStore for JsonlStateStore {
         let record = StateRecord {
             timestamp_unix_seconds: unix_timestamp(),
             original_id: asset_id.to_string(),
-            new_id: new_id.clone(),
+            new_id,
             write_mode: self.write_mode,
             outcome: outcome.clone(),
         };
@@ -966,7 +1007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_store_records_only_success() {
+    async fn state_store_records_terminal_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.jsonl");
         let state = JsonlStateStore::open(&path, WriteMode::UploadOnly).unwrap();
@@ -989,8 +1030,20 @@ mod tests {
             .unwrap();
         assert!(state.is_completed("a1").await.unwrap());
 
+        state
+            .record(
+                "a2",
+                &AssetOutcome::Kept {
+                    asset_id: "a2".into(),
+                    reason: "no worthwhile saving".into(),
+                },
+            )
+            .await
+            .unwrap();
+
         let reopened = JsonlStateStore::open(&path, WriteMode::UploadOnly).unwrap();
         assert!(reopened.is_completed("a1").await.unwrap());
+        assert!(reopened.is_completed("a2").await.unwrap());
     }
 
     #[test]

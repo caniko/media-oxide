@@ -7,7 +7,7 @@ use rs_immicher_oxide_core::types::{
     Asset, MediaCodec, MediaKind, TranscodedAsset, TranscodedPayload,
 };
 
-use crate::client::{AssetBulkUpdateDto, AssetMediaStatus, AssetType, ImmichApiClient};
+use crate::client::{AssetMediaStatus, AssetType, ImmichApiClient, UpdateAssetDto};
 use crate::ImmichConfig;
 
 /// Sink that uploads transcoded assets to Immich, copies metadata,
@@ -49,17 +49,13 @@ impl ImmichSink {
         format!("{base}.{ext}")
     }
 
-    /// Determine if the original had favorite/archived state from metadata.
-    fn extract_metadata(original: &Asset) -> (Option<bool>, Option<bool>) {
-        let is_favorite = original
-            .metadata
-            .get("is_favorite")
-            .and_then(|v| v.as_bool());
-        let is_archived = original
-            .metadata
-            .get("is_archived")
-            .and_then(|v| v.as_bool());
-        (is_favorite, is_archived)
+    /// Visibility for the replacement: archived stays archived, all else
+    /// reaches the timeline (hidden and locked assets are never discovered).
+    fn visibility(original: &Asset) -> &'static str {
+        match original.metadata.get("visibility").and_then(|v| v.as_str()) {
+            Some("archive") => "archive",
+            _ => "timeline",
+        }
     }
 }
 
@@ -77,7 +73,6 @@ impl Sink for ImmichSink {
             .created_at
             .as_deref()
             .unwrap_or("2024-01-01T00:00:00.000Z");
-        let (is_favorite, _) = Self::extract_metadata(original);
         let file_modified_at = original
             .metadata
             .get("file_modified_at")
@@ -94,7 +89,7 @@ impl Sink for ImmichSink {
                         file_created_at,
                         file_modified_at,
                         &filename,
-                        is_favorite.unwrap_or(false),
+                        Self::visibility(original),
                     )
                     .await
             }
@@ -106,7 +101,7 @@ impl Sink for ImmichSink {
                         file_created_at,
                         file_modified_at,
                         &filename,
-                        is_favorite.unwrap_or(false),
+                        Self::visibility(original),
                     )
                     .await
             }
@@ -123,36 +118,29 @@ impl Sink for ImmichSink {
     }
 
     async fn copy_metadata(&self, original: &Asset, new_id: &str) -> Result<()> {
-        let (is_favorite, is_archived) = Self::extract_metadata(original);
-
-        // 1. Bulk update: favorite + archive state
-        if is_favorite.is_some() || is_archived.is_some() {
-            self.client
-                .bulk_update_assets(&AssetBulkUpdateDto {
-                    ids: vec![new_id.to_string()],
-                    is_favorite,
-                    is_archived,
-                    rating: None,
-                })
-                .await
-                .map_err(|e| PipelineError::Sink(Box::new(e)))?;
-        }
-
-        // 2. Album membership: find albums containing the original, add new asset
-        let albums = self
-            .client
-            .get_albums_for_asset(&original.id)
+        let sink_err = |e| PipelineError::Sink(Box::new(e));
+        self.client
+            .copy_asset(&original.id, new_id)
             .await
-            .map_err(|e| PipelineError::Sink(Box::new(e)))?;
+            .map_err(sink_err)?;
 
-        if !albums.is_empty() {
-            let album_ids: Vec<String> = albums.into_iter().map(|a| a.id).collect();
+        let field = |name| original.metadata.get(name);
+        let dto = UpdateAssetDto {
+            description: field("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            rating: field("rating")
+                .and_then(|v| v.as_i64())
+                .filter(|r| *r != 0)
+                .map(|r| r as i32),
+        };
+        if dto.description.is_some() || dto.rating.is_some() {
             self.client
-                .add_assets_to_albums(&album_ids, &[new_id.to_string()])
+                .update_asset(new_id, &dto)
                 .await
-                .map_err(|e| PipelineError::Sink(Box::new(e)))?;
+                .map_err(sink_err)?;
         }
-
         Ok(())
     }
 
@@ -227,17 +215,23 @@ impl Sink for ImmichSink {
             }
         }
 
-        let resp = self
+        let mut resp = self
             .client
             .download_original(new_id)
             .await
             .map_err(|e| PipelineError::Sink(Box::new(e)))?;
-        let bytes = resp
-            .bytes()
+        let mut downloaded = 0u64;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| PipelineError::Sink(Box::new(e)))?;
-        if bytes.is_empty() {
-            return Err(PipelineError::Sink("new asset download is empty".into()));
+            .map_err(|e| PipelineError::Sink(Box::new(e)))?
+        {
+            downloaded += chunk.len() as u64;
+        }
+        if downloaded != byte_count {
+            return Err(PipelineError::Sink(
+                format!("new asset downloads {downloaded} bytes, uploaded {byte_count}").into(),
+            ));
         }
 
         Ok(())

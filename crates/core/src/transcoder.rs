@@ -24,11 +24,7 @@ pub trait Transcoder: Send + Sync {
 
     /// Whether this transcoder can accept the given asset.
     fn can_handle(&self, asset: &crate::types::Asset) -> bool {
-        asset.kind == self.kind()
-            && self
-                .input_codecs()
-                .iter()
-                .any(|c| *c == asset.codec || asset.codec == MediaCodec::Unknown)
+        asset.kind == self.kind() && self.input_codecs().contains(&asset.codec)
     }
 
     /// Transcode a source byte stream into the target format.
@@ -44,3 +40,48 @@ pub trait Transcoder: Send + Sync {
 }
 
 use std::io::Read;
+
+/// Replacements larger than this share of the original are not worth a lossy
+/// generation; the original is kept instead.
+pub const MAX_OUTPUT_RATIO: f64 = 0.9;
+
+/// Keep the original unless `output_bytes` is a worthwhile saving.
+pub fn require_saving(input_bytes: u64, output_bytes: u64) -> crate::error::Result<()> {
+    let ratio = output_bytes as f64 / input_bytes.max(1) as f64;
+    if output_bytes == 0 || ratio > MAX_OUTPUT_RATIO {
+        return Err(crate::error::PipelineError::Keep(format!(
+            "output is {:.0}% of the original",
+            ratio * 100.0
+        )));
+    }
+    Ok(())
+}
+
+/// Run an external encoder tool, returning its stdout. A non-zero exit is a
+/// transcoder error carrying the tool's stderr.
+pub fn run_tool(cmd: &mut std::process::Command) -> crate::error::Result<Vec<u8>> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            crate::error::PipelineError::Transcoder(format!("failed to run {program}: {e}").into())
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(crate::error::PipelineError::Transcoder(
+            format!("{program} exited with {}: {}", out.status, stderr.trim()).into(),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn require_saving_keeps_originals_without_a_real_saving() {
+        assert!(super::require_saving(100, 50).is_ok());
+        assert!(super::require_saving(100, 95).is_err());
+        assert!(super::require_saving(100, 0).is_err());
+    }
+}

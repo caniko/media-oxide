@@ -11,6 +11,3 @@ repository = "https://github.com/caniko/rs-immicher-oxide"
 
 [workspace.metadata.crane]
 name = "rs-immicher-oxide"
-
-[patch.crates-io]
-ff-pipeline = { path = "vendor/ff-pipeline" }

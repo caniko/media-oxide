@@ -17,6 +17,14 @@ let
       cfg.pollInterval
       "--write-mode"
       cfg.writeMode
+      "--video-crf"
+      (toString cfg.videoCrf)
+      "--video-preset"
+      (toString cfg.videoPreset)
+      "--video-min-vmaf"
+      (toString cfg.videoMinVmaf)
+      "--image-distance"
+      (toString cfg.imageDistance)
       "--state-path"
       cfg.statePath
       "--manifest-path"
@@ -40,24 +48,20 @@ in
 
     immichUrl = mkOption {
       type = types.str;
-      default = "http://localhost:2283";
-      example = "http://localhost:2283";
-      description = "Immich server URL (API base).";
+      default = "http://localhost:2283/api";
+      example = "http://localhost:2283/api";
+      description = "Immich API base URL, including the `/api` prefix.";
     };
 
     apiKeyFile = mkOption {
       type = types.nullOr types.path;
       default = null;
       description = ''
-        Path to a file containing a raw Immich API key.
+        Path to a file containing a raw Immich API key. The key's user is the
+        only owner whose assets are converted; it needs the asset read,
+        upload, update, copy, and delete permissions.
         Use agenix: `config.age.secrets.immich-api-key.path`
       '';
-    };
-
-    videoEncoder = mkOption {
-      type = types.enum [ "svt-av1-uhq" ];
-      default = "svt-av1-uhq";
-      description = "Video encoder to use for transcoding.";
     };
 
     videoCrf = mkOption {
@@ -69,25 +73,22 @@ in
     videoPreset = mkOption {
       type = types.int;
       default = 6;
-      description = "SVT-AV1 preset (0-13, lower = slower/better).";
+      description = "SVT-AV1 preset (0-13, lower = slower/smaller).";
     };
 
-    imageEncoder = mkOption {
-      type = types.enum [ "jxl-visual-lossless" "jxl-lossless" ];
-      default = "jxl-visual-lossless";
-      description = "Image encoder to use for transcoding.";
+    videoMinVmaf = mkOption {
+      type = types.float;
+      default = 95.0;
+      description = ''
+        Minimum mean VMAF an AV1 replacement must score against its source;
+        below it the original is kept.
+      '';
     };
 
     imageDistance = mkOption {
       type = types.float;
       default = 1.0;
       description = "JPEG XL butteraugli distance (0 = lossless, 1.0 = visually lossless).";
-    };
-
-    concurrency = mkOption {
-      type = types.int;
-      default = 2;
-      description = "Number of assets to process concurrently.";
     };
 
     pollInterval = mkOption {
@@ -137,29 +138,13 @@ in
     statePath = mkOption {
       type = types.str;
       default = "${stateDir}/state.jsonl";
-      description = "Append-only JSONL state file for verified successes.";
+      description = "Append-only JSONL state file for replaced and kept originals.";
     };
 
     manifestPath = mkOption {
       type = types.str;
       default = "${stateDir}/manifest.jsonl";
       description = "Append-only JSONL manifest for all run outcomes.";
-    };
-
-    renderDevice = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "/dev/dri/by-path/pci-0000:03:00.0-render";
-      description = ''
-        VAAPI render device node for GPU-accelerated decode.
-        Set to match the Immich ML device for atlas.
-      '';
-    };
-
-    workDir = mkOption {
-      type = types.path;
-      default = "/dev/shm/rs-immicher-oxide";
-      description = "Working directory for temp files (tmpfs recommended).";
     };
   };
 
@@ -184,33 +169,28 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
+      # Originals and encodes are spooled to disk, never to a RAM-backed /tmp.
+      environment.TMPDIR = "/var/tmp";
+
       serviceConfig = {
         Type = "simple";
         ExecStart = lib.escapeShellArgs execArgs;
         User = "immich-converter";
         Group = "immich-converter";
         StateDirectory = "rs-immicher-oxide";
-        RuntimeDirectory = "rs-immicher-oxide";
-        SupplementaryGroups =
-          [ "video" "render" ]
-          ++ lib.optional (cfg.renderDevice != null) "render";
         AmbientCapabilities = "";
         CapabilityBoundingSet = "";
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = true;
         NoNewPrivileges = true;
+        # Backlog encoding must never compete with interactive work.
+        Nice = 19;
+        CPUSchedulingPolicy = "idle";
+        IOSchedulingClass = "idle";
         Restart = "on-failure";
         RestartSec = "10s";
-      } // lib.optionalAttrs (cfg.renderDevice != null) {
-        DeviceAllow = "${cfg.renderDevice} rw";
       };
-
-      unitConfig.ConditionPathExists = cfg.workDir;
     };
-
-    systemd.tmpfiles.rules = [
-      "d ${cfg.workDir} 0750 immich-converter immich-converter -"
-    ];
   };
 }
