@@ -1,18 +1,22 @@
-# rs-immicher-oxide
+# media-oxide
 
 <!-- simit:badges:start -->
 
-![CI](https://img.shields.io/badge/CI-managed-2088ff) [![docs](https://img.shields.io/badge/docs-enabled-6f42c1)](https://docs.rs/rs-immicher-oxide) [![crates.io](https://img.shields.io/badge/crates.io-publishable-f46623)](https://crates.io/crates/rs-immicher-oxide)
+![CI](https://img.shields.io/badge/CI-managed-2088ff) [![docs](https://img.shields.io/badge/docs-enabled-6f42c1)](https://docs.rs/media-oxide) [![crates.io](https://img.shields.io/badge/crates.io-publishable-f46623)](https://crates.io/crates/media-oxide)
 
 <!-- simit:badges:end -->
 
 Immich media transcoding pipeline for replacing original assets with modern
 encodes: JPEG XL for images and AV1/Opus MP4 for videos.
 
-The workspace is split into small crates so the Immich API backend, pipeline
-orchestration, and codec implementations can evolve independently. The CLI
-crate wires those pieces together for one-shot conversion, polling daemon mode,
-and a small webhook listener.
+The workspace hosts `media-oxide`, a crate of shared media format helpers, plus
+the Immich converter that uses it. The converter's crate, binary, NixOS module,
+and flake output names are unchanged for existing deployments.
+
+The workspace is split into small crates so the media helpers, Immich API
+backend, pipeline orchestration, and codec implementations can evolve
+independently. The CLI crate wires those pieces together for one-shot
+conversion, polling daemon mode, and a small webhook listener.
 
 ## Status
 
@@ -35,6 +39,7 @@ media.
 
 | Crate | Purpose |
 | --- | --- |
+| `media-oxide` | Shared JPEG XL encoding, container, and decoding helpers |
 | `rs-immicher-oxide` | CLI runtime in `crates/cli` |
 | `rs-immicher-oxide-core` | Pipeline traits, state, outcomes, and shared media types |
 | `rs-immicher-oxide-backend-immich` | Immich asset discovery, download, upload, metadata copy, and deletion |

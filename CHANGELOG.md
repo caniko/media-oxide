@@ -4,6 +4,9 @@
 
 ### Changed
 
+- The workspace is renamed to `media-oxide` after its shared crate. The
+  `rs-immicher-oxide-*` crate names, the CLI binary, the NixOS module, and the
+  flake output attributes are unchanged, so existing hosts keep working.
 - Images are encoded by libjxl's `cjxl` (Exif, XMP, ICC, and orientation kept)
   and only JPEG and PNG are converted; videos are encoded by the `ffmpeg` CLI
   with SVT-AV1 10-bit and gated by a per-video VMAF floor (`--video-min-vmaf`,
@@ -31,6 +34,10 @@
 
 ### Added
 
+- `media-oxide`, a shared crate for JPEG XL encoding through `cjxl`,
+  container metadata stripping, and optional jxl-oxide decoding, validation,
+  header dimensions, and progressive-preview cuts. `rs-immicher-oxide-codec-jxl`
+  now encodes through it instead of keeping its own `cjxl` invocation.
 - `TranscodedPayload` enum with `Reader` and `File` variants for memory-efficient
   file-backed transcoder output.
 - `ImmichApiClient::upload_asset_file()` for streaming file uploads without

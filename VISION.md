@@ -1,11 +1,17 @@
-# rs-immicher-oxide vision
+# media-oxide vision
 
-`rs-immicher-oxide` is an Immich media transcoding pipeline. It discovers
-original assets through the Immich API, re-encodes images to JPEG XL and video
-to AV1/Opus MP4, uploads the result, copies metadata, verifies that the new
-asset is readable, and only then deletes the original. It runs against a
-self-hosted Immich library in one-shot or polling-daemon mode, and exposes a
-webhook listener that currently performs dry-run discovery only.
+`media-oxide` is a Rust workspace with two jobs: shared media format crates,
+and an Immich media transcoding pipeline built on them. The first shared crate,
+`media-oxide`, owns JPEG XL encoding, container inspection, and decoding. The
+converter discovers original assets through the Immich API, re-encodes images
+to JPEG XL and video to AV1/Opus MP4, uploads the result, copies metadata,
+verifies that the new asset is readable, and only then deletes the original. It
+runs against a self-hosted Immich library in one-shot or polling-daemon mode,
+and exposes a webhook listener that currently performs dry-run discovery only.
+
+The converter keeps its existing crate, binary, NixOS module, and flake output
+names; only the workspace name changed, so deployments and fleet consumers do
+not move.
 
 ## Problem
 
@@ -23,9 +29,9 @@ design constraint.
 - The sink lifecycle is fixed and ordered: upload the transcoded asset, copy
   selected metadata from the original, verify the new asset is readable, delete
   the original.
-- The workspace is split into small crates — core, Immich backend, JXL codec,
-  AV1 codec, CLI — so the API backend, pipeline orchestration, and codecs evolve
-  independently.
+- The workspace is split into small crates — shared media helpers, core, Immich
+  backend, JXL codec, AV1 codec, CLI — so format handling, the API backend,
+  pipeline orchestration, and codecs evolve independently.
 - Media handling is memory-conscious: transcoder output is a reader or a
   file-backed payload, uploads stream from file, and the pipeline can process
   assets concurrently.
