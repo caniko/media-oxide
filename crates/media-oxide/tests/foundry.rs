@@ -280,11 +280,19 @@ fn magic_bytes_must_match_the_extension() {
     assert!(sniff_matches("a.avif", b"\0\0\0\x1cftypavif"));
     assert!(!sniff_matches("a.avif", b"\0\0\0\x18ftypisom"));
     assert!(!sniff_matches("a.mp4", b"\0\0\0\x1cftypavif"));
+    // AVIF commonly declares major brand `mif1` with `avif` compatible.
+    let mif1 = b"\0\0\0\x1cftypmif1\0\0\0\0mif1avifmiaf";
+    assert!(sniff_matches("a.avif", mif1));
+    assert!(!sniff_matches("a.mp4", mif1));
     assert!(sniff_matches("a.m4a", b"\0\0\0\x20ftypM4A "));
     assert!(sniff_matches("a.aac", &[0xff, 0xf1, 0x50]));
     assert!(sniff_matches(
         "a.svg",
         b"\xef\xbb\xbf<?xml version=\"1.0\"?>\n<!-- icon -->\n<svg width=\"1\">"
+    ));
+    assert!(sniff_matches(
+        "a.svg",
+        b"<?xml version=\"1.0\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg width=\"1\">"
     ));
     assert!(!sniff_matches("a.svg", b"<html><svg/></html>"));
     assert!(!sniff_matches("a.svg", b"hello <svg"));

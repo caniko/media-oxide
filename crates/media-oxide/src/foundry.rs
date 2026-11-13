@@ -391,8 +391,18 @@ pub fn sniff_matches(file_name: &str, head: &[u8]) -> bool {
     }
 }
 
+/// Whether the `ftyp` box names `avif`/`avis` as its major brand or as one of
+/// its compatible brands (AVIF often declares major brand `mif1`).
 fn avif_brand(head: &[u8]) -> bool {
-    magic_at(head, 8, b"avif") || magic_at(head, 8, b"avis")
+    let size = head
+        .get(..4)
+        .map_or(0, |bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize);
+    let end = size.min(head.len());
+    // Major brand at 8, minor version at 12, compatible brands from 16.
+    std::iter::once(8)
+        .chain((16..end).step_by(4))
+        .filter_map(|offset| head.get(offset..offset + 4))
+        .any(|brand| brand == b"avif" || brand == b"avis")
 }
 
 /// Whether the first element after the prolog (BOM, XML declaration,
@@ -416,6 +426,14 @@ fn svg_root_first(head: &[u8]) -> bool {
         } else if let Some(after) = rest.strip_prefix("<!--") {
             match after.find("-->") {
                 Some(end) => rest = after[end + 3..].trim_start(),
+                None => return false,
+            }
+        } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("<!doctype") {
+            // An internal subset ends at `]>`; `svg_is_safe` refuses entities.
+            let subset = rest.find('[').is_some_and(|open| rest.find('>') > Some(open));
+            let close = if subset { "]>" } else { ">" };
+            match rest.find(close) {
+                Some(end) => rest = rest[end + close.len()..].trim_start(),
                 None => return false,
             }
         } else {
