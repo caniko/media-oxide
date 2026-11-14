@@ -283,10 +283,9 @@ pub fn plan(
             }
         }
         Family::Video => (format!("{stem}.webm"), Action::Ffmpeg(video_arguments())),
-        Family::Audio if lossless(extension.as_str()) => (
-            format!("{stem}.ogg"),
-            Action::Ffmpeg(audio_arguments(opts)),
-        ),
+        Family::Audio if lossless(extension.as_str()) => {
+            (format!("{stem}.ogg"), Action::Ffmpeg(audio_arguments(opts)))
+        }
         // `.oga` is Ogg audio; Foundry and the upload check know it as `.ogg`.
         Family::Audio if extension == "oga" => (format!("{stem}.ogg"), Action::Copy),
         Family::Audio => (format!("{stem}.{extension}"), Action::Copy),
@@ -394,9 +393,9 @@ pub fn sniff_matches(file_name: &str, head: &[u8]) -> bool {
 /// Whether the `ftyp` box names `avif`/`avis` as its major brand or as one of
 /// its compatible brands (AVIF often declares major brand `mif1`).
 fn avif_brand(head: &[u8]) -> bool {
-    let size = head
-        .get(..4)
-        .map_or(0, |bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize);
+    let size = head.get(..4).map_or(0, |bytes| {
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+    });
     let end = size.min(head.len());
     // Major brand at 8, minor version at 12, compatible brands from 16.
     std::iter::once(8)
@@ -433,7 +432,9 @@ fn svg_root_first(head: &[u8]) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
         {
             // An internal subset ends at `]>`; `svg_is_safe` refuses entities.
-            let subset = rest.find('[').is_some_and(|open| rest.find('>') > Some(open));
+            let subset = rest
+                .find('[')
+                .is_some_and(|open| rest.find('>') > Some(open));
             let close = if subset { "]>" } else { ">" };
             match rest.find(close) {
                 Some(end) => rest = rest[end + close.len()..].trim_start(),
@@ -703,8 +704,8 @@ fn magic_at(head: &[u8], offset: usize, magic: &[u8]) -> bool {
 
 fn event_attribute(lower: &str) -> bool {
     lower.match_indices("on").any(|(index, _)| {
-        let boundary = index == 0
-            || !matches!(lower.as_bytes()[index - 1], b'a'..=b'z' | b'0'..=b'9' | b'-');
+        let boundary =
+            index == 0 || !matches!(lower.as_bytes()[index - 1], b'a'..=b'z' | b'0'..=b'9' | b'-');
         if !boundary {
             return false;
         }
@@ -809,7 +810,14 @@ fn probe_dimensions(input: &Path) -> Result<Probe> {
 /// One `-show_entries` query on the first video stream, as CSV text.
 fn ffprobe(input: &Path, entries: &str) -> Result<String> {
     let output = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", entries])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            entries,
+        ])
         .args(["-of", "csv=p=0"])
         .arg(input)
         .stdin(std::process::Stdio::null())

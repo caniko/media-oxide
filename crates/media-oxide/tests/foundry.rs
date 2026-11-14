@@ -47,7 +47,10 @@ fn token_plans_a_square_transparent_pad() {
     let filter = &arguments[arguments.iter().position(|arg| arg == "-vf").expect("-vf") + 1];
     assert!(filter.contains("format=rgba"), "{filter}");
     assert!(filter.contains("scale=400:400"), "{filter}");
-    assert!(filter.contains("force_original_aspect_ratio=decrease"), "{filter}");
+    assert!(
+        filter.contains("force_original_aspect_ratio=decrease"),
+        "{filter}"
+    );
     assert!(filter.contains("pad=400:400"), "{filter}");
     assert!(arguments.iter().any(|arg| arg == "-quality"));
 }
@@ -138,7 +141,15 @@ fn lossless_audio_becomes_ogg_with_the_chosen_codec() {
     assert_eq!(planned.file_name, "rain.ogg");
     assert_eq!(
         ffmpeg_arguments(&planned),
-        ["-c:a", "libvorbis", "-b:a", "128k", "-vn", "-map_metadata", "-1"]
+        [
+            "-c:a",
+            "libvorbis",
+            "-b:a",
+            "128k",
+            "-vn",
+            "-map_metadata",
+            "-1"
+        ]
     );
 
     let opus = Options {
@@ -225,9 +236,7 @@ fn svg_gains_dimensions_from_its_view_box() {
 fn unsafe_svg_is_rejected() {
     assert!(!svg_is_safe("<svg><script>alert(1)</script></svg>"));
     assert!(!svg_is_safe("<svg onload=\"alert(1)\"/>"));
-    assert!(!svg_is_safe(
-        "<svg><a href=\"javascript:alert(1)\"/></svg>"
-    ));
+    assert!(!svg_is_safe("<svg><a href=\"javascript:alert(1)\"/></svg>"));
     assert!(!svg_is_safe("<svg><foreignObject/></svg>"));
     // Bypasses a naive denylist misses.
     assert!(!svg_is_safe("<svg onload = \"alert(1)\"/>"));
@@ -235,8 +244,12 @@ fn unsafe_svg_is_rejected() {
     assert!(!svg_is_safe(
         "<s:svg xmlns:s=\"http://www.w3.org/2000/svg\"><s:script>alert(1)</s:script></s:svg>"
     ));
-    assert!(!svg_is_safe("<svg><a href=\"java&#x73;cript:alert(1)\"/></svg>"));
-    assert!(!svg_is_safe("<svg><a href=\"java\tscript:alert(1)\"/></svg>"));
+    assert!(!svg_is_safe(
+        "<svg><a href=\"java&#x73;cript:alert(1)\"/></svg>"
+    ));
+    assert!(!svg_is_safe(
+        "<svg><a href=\"java\tscript:alert(1)\"/></svg>"
+    ));
     assert!(!svg_is_safe(
         "<!DOCTYPE svg [<!ENTITY js \"javascript:\">]><svg><a href=\"&js;alert(1)\"/></svg>"
     ));
@@ -336,7 +349,11 @@ fn dimensions(path: &Path) -> (u32, u32) {
         .arg(path)
         .output()
         .expect("run ffprobe");
-    assert!(output.status.success(), "ffprobe failed on {}", path.display());
+    assert!(
+        output.status.success(),
+        "ffprobe failed on {}",
+        path.display()
+    );
     let text = String::from_utf8_lossy(&output.stdout);
     let mut fields = text.trim().split(',');
     let width = fields.next().and_then(|value| value.parse().ok());
