@@ -18,13 +18,16 @@ include = ["Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "src/**"]
 decode = ["dep:image", "dep:jxl-frame", "dep:jxl-oxide"]
 # Foundry VTT asset conversion policy (`ffmpeg`/`ffprobe`) and the pure
 # upload-validation helpers a server calls.
-foundry = []
+foundry = ["dep:roxmltree"]
 
 [dependencies]
 image = { version = "0.25", default-features = false, optional = true }
 # Exact pins: the frame/TOC API and the preview cut rule are tied to them.
 jxl-frame = { version = "=0.13.3", optional = true }
 jxl-oxide = { version = "=0.12.6", optional = true }
+# Upload SVG validation reads a real XML tree, so namespaces, comments and the
+# prolog are the parser's problem rather than a denylist's.
+roxmltree = { version = "0.21", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

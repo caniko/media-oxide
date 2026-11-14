@@ -233,6 +233,77 @@ fn svg_gains_dimensions_from_its_view_box() {
 }
 
 #[test]
+fn svg_size_finds_the_root_past_comments_and_prolog() {
+    // The first `<svg` is inside a comment; sizing it would leave the real
+    // root unsized.
+    let commented = r#"<!-- <svg viewBox="0 0 3 4"> --><svg viewBox="0 0 120 80"/>"#;
+    assert_eq!(
+        svg_with_size(commented).expect("sized past the comment"),
+        r#"<!-- <svg viewBox="0 0 3 4"> --><svg width="120" height="80" viewBox="0 0 120 80"/>"#
+    );
+    let prolog = concat!(
+        "<?xml version=\"1.0\"?>\n",
+        "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+        "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+        "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+        "<svg viewBox=\"0 0 120 80\"/>",
+    );
+    assert_eq!(
+        svg_with_size(prolog).expect("sized past the prolog"),
+        concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+            "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg width=\"120\" height=\"80\" viewBox=\"0 0 120 80\"/>",
+        )
+    );
+    // A prefixed root is sized after its own name, not after `<svg`.
+    assert_eq!(
+        svg_with_size(r#"<s:svg xmlns:s="http://www.w3.org/2000/svg" viewBox="0 0 5 6"/>"#)
+            .expect("sized prefixed root"),
+        r#"<s:svg width="5" height="6" xmlns:s="http://www.w3.org/2000/svg" viewBox="0 0 5 6"/>"#
+    );
+}
+
+#[test]
+fn convert_sizes_an_svg_and_refuses_a_scripted_one() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let benign = directory.path().join("Icon Mask.svg");
+    std::fs::write(
+        &benign,
+        concat!(
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\"><rect/></svg>",
+        ),
+    )
+    .expect("write svg");
+    let output = convert(&benign, None, &options(), directory.path()).expect("svg conversion");
+    assert_eq!(output, directory.path().join("artwork/icon-mask.svg"));
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("read svg"),
+        concat!(
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg width=\"120\" height=\"80\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\"><rect/></svg>",
+        )
+    );
+
+    let scripted = directory.path().join("Scripted.svg");
+    std::fs::write(
+        &scripted,
+        concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><iframe ",
+            "xmlns=\"http://www.w3.org/1999/xhtml\" ",
+            "srcdoc=\"&lt;script&gt;alert(1)&lt;/script&gt;\"/></svg>",
+        ),
+    )
+    .expect("write scripted svg");
+    let refused = convert(&scripted, None, &options(), directory.path());
+    assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    assert!(!directory.path().join("artwork/scripted.svg").exists());
+}
+
+#[test]
 fn unsafe_svg_is_rejected() {
     assert!(!svg_is_safe("<svg><script>alert(1)</script></svg>"));
     assert!(!svg_is_safe("<svg onload=\"alert(1)\"/>"));
@@ -255,6 +326,67 @@ fn unsafe_svg_is_rejected() {
     ));
     assert!(svg_is_safe(
         "<svg width=\"1\" height=\"1\"><rect font-size=\"2\"/></svg>"
+    ));
+}
+
+#[test]
+fn namespaced_frames_and_foreign_elements_are_rejected() {
+    // Chromium executes the embedded script when it opens this SVG, and
+    // nothing in the markup spells `script` outside the `srcdoc` value.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"/></foreignObject></svg>"#
+    ));
+    // A foreign namespace is refused even for an allowlisted local name.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:h="http://www.w3.org/1999/xhtml"><h:rect/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><embed xmlns="http://www.w3.org/1999/xhtml"/></svg>"#
+    ));
+    // Elements outside the allowlist cannot arrive through another prefix.
+    assert!(!svg_is_safe(
+        r#"<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></s:svg>"#
+    ));
+}
+
+#[test]
+fn script_reach_in_attributes_is_rejected() {
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><a xlink:href="javascript:alert(1)" xmlns:xlink="http://www.w3.org/1999/xlink"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><a href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;"/></svg>"#
+    ));
+    // CSS and presentation attributes can reach the network.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect style="fill:url(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<?xml-stylesheet href="https://example.invalid/a.css"?><svg xmlns="http://www.w3.org/2000/svg"/>"#
+    ));
+}
+
+#[test]
+fn plain_drawing_svg_still_passes() {
+    assert!(svg_is_safe(
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 80" width="120" height="80">
+  <!-- icon -->
+  <defs><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient><clipPath id="c"><rect width="10" height="10"/></clipPath></defs>
+  <g fill="url(#g)" clip-path="url(#c)">
+    <path d="M0 0h10v10H0z"/>
+    <circle cx="5" cy="5" r="4"/>
+    <use xlink:href="#c"/>
+    <a href="#c"><text x="1" y="2" font-size="2">A</text></a>
+  </g>
+</svg>"##
     ));
 }
 
