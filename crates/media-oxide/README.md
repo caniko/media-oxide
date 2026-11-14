@@ -71,3 +71,9 @@ What cannot be automated, so the DM handles it:
   the grid drawn in, or let Foundry draw it.
 - Grid snapping starts at the top-left corner. A map whose grid starts anywhere
   else keeps that offset.
+
+## License
+
+Licensed under either of `MIT` (`LICENSE-MIT`) or `Apache-2.0`
+(`LICENSE-APACHE`), at your option. The rest of this workspace stays
+`AGPL-3.0-only`.

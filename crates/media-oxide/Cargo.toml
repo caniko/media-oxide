@@ -3,14 +3,14 @@ name = "media-oxide"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 description = "JPEG XL encoding, container, and decoding helpers for media pipelines."
 documentation = "https://docs.rs/media-oxide"
 readme = "README.md"
 keywords = ["jpeg-xl", "jxl", "image", "transcode", "media"]
 categories = ["multimedia::images", "encoding"]
-include = ["Cargo.toml", "README.md", "src/**"]
+include = ["Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "src/**"]
 
 [features]
 # JPEG XL decoding, validation, dimensions, and preview cuts. The default

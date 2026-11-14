@@ -4,6 +4,8 @@
 
 ### Changed
 
+- The `media-oxide` crate is now licensed `MIT OR Apache-2.0`, so permissively
+  licensed tools can link it. The rest of the workspace stays `AGPL-3.0-only`.
 - The workspace is renamed to `media-oxide` after its shared crate. The
   `rs-immicher-oxide-*` crate names, the CLI binary, the NixOS module, and the
   flake output attributes are unchanged, so existing hosts keep working.

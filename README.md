@@ -231,4 +231,5 @@ simit release trust check
 
 ## License
 
-Licensed under `AGPL-3.0-only`. See `LICENSE`.
+Licensed under `AGPL-3.0-only`. See `LICENSE`. The `media-oxide` crate is the
+exception: it is `MIT OR Apache-2.0` (see `crates/media-oxide`).
