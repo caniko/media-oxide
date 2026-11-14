@@ -22,6 +22,16 @@
 
 ### Fixed
 
+- SVG uploads are validated against a namespace-aware allowlist rather than a
+  denylist, so an XHTML-namespaced `<iframe srcdoc>` (which Chromium executes),
+  `foreignObject`, event-handler attributes, `javascript:`/`data:` references,
+  external `url()` references, CSS escapes in attribute values, and any non-SVG
+  element are refused. Entity, element, attribute-list and notation
+  declarations are refused anywhere in the raw text, so an internal
+  `<!DOCTYPE … […]>` subset cannot hide behind a quoted or malformed XML
+  declaration, and no declared entity is ever expanded. A document over 8 MiB,
+  or one with more than 100 000 XML nodes, is refused. Dimensions are added to
+  the real root element, so a commented-out `<svg>` can no longer shadow it.
 - Discovery followed `next_page` instead of Immich's `nextPage` and stopped at
   `total`, which is the page length, so only the first 500 assets were seen.
 - Search filters were sent in snake_case and silently ignored.

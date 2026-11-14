@@ -9,7 +9,7 @@ use std::path::Path;
 
 use media_oxide::foundry::{
     allowed_upload, convert, needs_probe, normalize_stem, plan, sniff_matches, svg_is_safe,
-    svg_with_size, Action, AssetKind, AudioCodec, Error, Options, Plan, Probe,
+    svg_with_size, Action, AssetKind, AudioCodec, Error, Options, Plan, Probe, MAX_SVG_BYTES,
 };
 
 fn options() -> Options {
@@ -233,6 +233,77 @@ fn svg_gains_dimensions_from_its_view_box() {
 }
 
 #[test]
+fn svg_size_finds_the_root_past_comments_and_prolog() {
+    // The first `<svg` is inside a comment; sizing it would leave the real
+    // root unsized.
+    let commented = r#"<!-- <svg viewBox="0 0 3 4"> --><svg viewBox="0 0 120 80"/>"#;
+    assert_eq!(
+        svg_with_size(commented).expect("sized past the comment"),
+        r#"<!-- <svg viewBox="0 0 3 4"> --><svg width="120" height="80" viewBox="0 0 120 80"/>"#
+    );
+    let prolog = concat!(
+        "<?xml version=\"1.0\"?>\n",
+        "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+        "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+        "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+        "<svg viewBox=\"0 0 120 80\"/>",
+    );
+    assert_eq!(
+        svg_with_size(prolog).expect("sized past the prolog"),
+        concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+            "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg width=\"120\" height=\"80\" viewBox=\"0 0 120 80\"/>",
+        )
+    );
+    // A prefixed root is sized after its own name, not after `<svg`.
+    assert_eq!(
+        svg_with_size(r#"<s:svg xmlns:s="http://www.w3.org/2000/svg" viewBox="0 0 5 6"/>"#)
+            .expect("sized prefixed root"),
+        r#"<s:svg width="5" height="6" xmlns:s="http://www.w3.org/2000/svg" viewBox="0 0 5 6"/>"#
+    );
+}
+
+#[test]
+fn convert_sizes_an_svg_and_refuses_a_scripted_one() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let benign = directory.path().join("Icon Mask.svg");
+    std::fs::write(
+        &benign,
+        concat!(
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\"><rect/></svg>",
+        ),
+    )
+    .expect("write svg");
+    let output = convert(&benign, None, &options(), directory.path()).expect("svg conversion");
+    assert_eq!(output, directory.path().join("artwork/icon-mask.svg"));
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("read svg"),
+        concat!(
+            "<!-- <svg viewBox=\"0 0 3 4\"/> -->\n",
+            "<svg width=\"120\" height=\"80\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\"><rect/></svg>",
+        )
+    );
+
+    let scripted = directory.path().join("Scripted.svg");
+    std::fs::write(
+        &scripted,
+        concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><iframe ",
+            "xmlns=\"http://www.w3.org/1999/xhtml\" ",
+            "srcdoc=\"&lt;script&gt;alert(1)&lt;/script&gt;\"/></svg>",
+        ),
+    )
+    .expect("write scripted svg");
+    let refused = convert(&scripted, None, &options(), directory.path());
+    assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    assert!(!directory.path().join("artwork/scripted.svg").exists());
+}
+
+#[test]
 fn unsafe_svg_is_rejected() {
     assert!(!svg_is_safe("<svg><script>alert(1)</script></svg>"));
     assert!(!svg_is_safe("<svg onload=\"alert(1)\"/>"));
@@ -255,6 +326,154 @@ fn unsafe_svg_is_rejected() {
     ));
     assert!(svg_is_safe(
         "<svg width=\"1\" height=\"1\"><rect font-size=\"2\"/></svg>"
+    ));
+}
+
+#[test]
+fn namespaced_frames_and_foreign_elements_are_rejected() {
+    // Chromium executes the embedded script when it opens this SVG, and
+    // nothing in the markup spells `script` outside the `srcdoc` value.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"/></foreignObject></svg>"#
+    ));
+    // A foreign namespace is refused even for an allowlisted local name.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:h="http://www.w3.org/1999/xhtml"><h:rect/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><embed xmlns="http://www.w3.org/1999/xhtml"/></svg>"#
+    ));
+    // Elements outside the allowlist cannot arrive through another prefix.
+    assert!(!svg_is_safe(
+        r#"<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></s:svg>"#
+    ));
+}
+
+#[test]
+fn script_reach_in_attributes_is_rejected() {
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><a xlink:href="javascript:alert(1)" xmlns:xlink="http://www.w3.org/1999/xlink"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><a href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;"/></svg>"#
+    ));
+    // CSS and presentation attributes can reach the network.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect style="fill:url(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<?xml-stylesheet href="https://example.invalid/a.css"?><svg xmlns="http://www.w3.org/2000/svg"/>"#
+    ));
+}
+
+#[test]
+fn css_escapes_in_attribute_values_are_rejected() {
+    // `u\72l(` is `url(` to a CSS parser but not to a literal search.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="u\72l(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="\75rl(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(#g\)"/></svg>"#
+    ));
+}
+
+#[test]
+fn internal_dtd_subsets_are_refused_before_parsing() {
+    // A defaulted event handler lives in the subset, where roxmltree cannot see
+    // it and Chromium applies it.
+    assert!(!svg_is_safe(
+        r#"<!DOCTYPE svg [<!ATTLIST svg onload CDATA "alert(1)">]><svg/>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<!DOCTYPE svg [<!ENTITY js "javascript:">]><svg><a href="&js;"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        "<!-- <!DOCTYPE svg [<!ENTITY a \"x\">]> --><!DOCTYPE svg [<!ENTITY b \"y\">]><svg/>"
+    ));
+    // A doctype without a subset is still a plain document.
+    assert!(svg_is_safe(
+        r#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg width="1" height="1"/>"#
+    ));
+}
+
+#[test]
+fn entity_bombs_and_oversized_documents_are_rejected_quickly() {
+    // Nothing is expanded: the subset is refused from the raw text.
+    let mut bomb = String::from(r#"<!DOCTYPE svg [<!ENTITY a "lollollollollollol">"#);
+    for level in 1..24 {
+        bomb.push_str(&format!(
+            r#"<!ENTITY l{level} "{}">"#,
+            format!("&l{};", level - 1).repeat(10)
+        ));
+    }
+    bomb.push_str("]><svg>&l23;</svg>");
+    let started = std::time::Instant::now();
+    assert!(!svg_is_safe(&bomb));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "the bomb took {:?}",
+        started.elapsed()
+    );
+
+    let mut oversized = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#);
+    oversized.push_str(&"a".repeat(MAX_SVG_BYTES));
+    assert!(!svg_is_safe(&oversized));
+    assert!(matches!(svg_with_size(&oversized), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn quoted_xml_declaration_cannot_hide_an_entity_subset() {
+    // `?>` inside the quoted version value used to end the prolog scan early,
+    // so the subset below was never inspected while roxmltree expanded it:
+    // ~22 KB of text becoming 16 MiB, through both entry points.
+    let mut bomb = String::from(r#"<?xml version="1.0?>"?>"#);
+    bomb.push_str(r#"<!DOCTYPE svg [<!ENTITY a ""#);
+    bomb.push_str(&"x".repeat(2_580));
+    bomb.push_str(r#"">]>"#);
+    bomb.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>"#);
+    bomb.push_str(&"&a;".repeat(6_500));
+    bomb.push_str("</text></svg>");
+    assert!(bomb.len() < 64 * 1024, "reproducer is {} bytes", bomb.len());
+
+    let started = std::time::Instant::now();
+    assert!(!svg_is_safe(&bomb), "the declaration bypass was accepted");
+    assert!(
+        matches!(svg_with_size(&bomb), Err(Error::Invalid(_))),
+        "the declaration bypass was accepted for sizing"
+    );
+    // Rejection is a scan of the raw text; expanding the subset takes hundreds
+    // of milliseconds and 16 MiB even in a debug build.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "the declaration bypass took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn plain_drawing_svg_still_passes() {
+    assert!(svg_is_safe(
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 80" width="120" height="80">
+  <!-- icon -->
+  <defs><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient><clipPath id="c"><rect width="10" height="10"/></clipPath></defs>
+  <g fill="url(#g)" clip-path="url(#c)">
+    <path d="M0 0h10v10H0z"/>
+    <circle cx="5" cy="5" r="4"/>
+    <use xlink:href="#c"/>
+    <a href="#c"><text x="1" y="2" font-size="2">A</text></a>
+  </g>
+</svg>"##
     ));
 }
 

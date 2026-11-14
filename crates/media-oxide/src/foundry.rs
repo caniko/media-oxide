@@ -449,44 +449,266 @@ fn svg_root_first(head: &[u8]) -> bool {
     }
 }
 
+/// Namespace of the SVG elements an upload may keep.
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+
+/// Static drawing elements an upload may keep.
+///
+/// Anything absent is rejected, including `script`, `foreignObject`, `iframe`,
+/// `image`, `style`, animation, and every non-SVG element. An allowlist is the
+/// point: the denylist this replaced missed a namespaced `<iframe srcdoc>`
+/// that Chromium executes when it opens the image.
+const SAFE_SVG_ELEMENTS: &[&str] = &[
+    "a",
+    "circle",
+    "clipPath",
+    "defs",
+    "desc",
+    "ellipse",
+    "feBlend",
+    "feColorMatrix",
+    "feComposite",
+    "feFlood",
+    "feGaussianBlur",
+    "feMerge",
+    "feMergeNode",
+    "feOffset",
+    "filter",
+    "g",
+    "line",
+    "linearGradient",
+    "marker",
+    "mask",
+    "path",
+    "pattern",
+    "polygon",
+    "polyline",
+    "radialGradient",
+    "rect",
+    "stop",
+    "svg",
+    "switch",
+    "symbol",
+    "text",
+    "textPath",
+    "title",
+    "tspan",
+    "use",
+];
+
+/// Largest SVG upload the validator reads, in bytes.
+///
+/// A drawing is a few hundred kilobytes at most, and parsing is work
+/// proportional to the input, so a larger file is refused before it is parsed.
+pub const MAX_SVG_BYTES: usize = 8 * 1024 * 1024;
+
+/// Parse `text` as an XML document, keeping DTDs so a benign doctype still
+/// converts. DTD markup never reaches this function: see [`refuses_dtd`]. The
+/// node limit bounds the tree even for a document with no DTD at all.
+fn parse_svg(text: &str) -> Option<roxmltree::Document<'_>> {
+    roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            nodes_limit: 100_000,
+            ..roxmltree::ParsingOptions::default()
+        },
+    )
+    .ok()
+}
+
+/// Whether `text` declares DTD markup an internal subset would carry.
+///
+/// `<!ENTITY>`, `<!ATTLIST>`, `<!ELEMENT>` and `<!NOTATION>` only occur inside an
+/// internal subset, and matching them on the raw text cannot be bypassed by
+/// escaping, quoting or a malformed declaration. A false positive inside a
+/// comment only refuses a file that declared nothing.
+fn declares_dtd_markup(text: &str) -> bool {
+    const DECLARATIONS: [&str; 4] = ["<!ENTITY", "<!ATTLIST", "<!ELEMENT", "<!NOTATION"];
+    let bytes = text.as_bytes();
+    DECLARATIONS.iter().any(|declaration| {
+        bytes
+            .windows(declaration.len())
+            .any(|window| window.eq_ignore_ascii_case(declaration.as_bytes()))
+    })
+}
+
+/// Offset just past a `<? ... ?>` instruction, tracking quotes inside it.
+///
+/// A quoted pseudo-attribute may contain `?>` (`<?xml version="1.0?>"?>`), so
+/// the terminator only counts outside quotes. `None` means the instruction does
+/// not terminate: a declaration that cannot be read cannot be trusted.
+fn instruction_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 2;
+    let mut quote = None;
+    while index < bytes.len() {
+        match quote {
+            Some(delimiter) => {
+                if bytes[index] == delimiter {
+                    quote = None;
+                }
+                index += 1;
+            }
+            None => match bytes[index] {
+                b'"' | b'\'' => {
+                    quote = Some(bytes[index]);
+                    index += 1;
+                }
+                b'?' if bytes.get(index + 1) == Some(&b'>') => return Some(index + 2),
+                _ => index += 1,
+            },
+        }
+    }
+    None
+}
+
+/// Whether the document declares DTD markup, an internal subset, or a prolog
+/// that cannot be read.
+///
+/// An internal subset is the validator's blind spot: `<!ATTLIST ...>` defaults
+/// are applied by browsers but not by roxmltree, so a defaulted `onload` would
+/// never be seen, and declared entities are expanded during parsing. The raw
+/// text is checked before anything parses or expands, and a plain doctype
+/// without a subset stays allowed.
+fn refuses_dtd(text: &str) -> bool {
+    if declares_dtd_markup(text) {
+        return true;
+    }
+    let mut rest = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if rest.starts_with("<?") {
+            let Some(end) = instruction_end(rest) else {
+                return true;
+            };
+            rest = rest[end..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            let Some(end) = after.find("-->") else {
+                return true;
+            };
+            rest = after[end + 3..].trim_start();
+        } else if rest
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
+        {
+            let mut quote = None;
+            for character in rest.chars() {
+                match quote {
+                    Some(delimiter) => {
+                        if character == delimiter {
+                            quote = None;
+                        }
+                    }
+                    None => match character {
+                        '"' | '\'' => quote = Some(character),
+                        '[' => return true,
+                        '>' => return false,
+                        _ => {}
+                    },
+                }
+            }
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
 /// Whether an SVG is safe to hand to a browser.
 ///
-/// ponytail: a denylist, not a sanitizer; swap in a real sanitizer if SVGs from
-/// untrusted authors must render.
+/// The document must fit [`MAX_SVG_BYTES`], declare no DTD markup or internal
+/// subset, and parse as XML. Every element must be in the SVG namespace (or no
+/// namespace, for the common xmlns-less file) and be one of the allowed drawing
+/// elements, and every attribute must avoid script and network reach: no `on*`
+/// handlers, no `style`, no `javascript:` value, no CSS escapes, and no `href`
+/// or `url()` pointing outside the document.
 pub fn svg_is_safe(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    // Character references and DTD entities can spell any blocked word, and
-    // browsers drop whitespace inside URL schemes, so refuse the former and
-    // match schemes with whitespace removed.
-    let compact: String = lower
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect();
-    if ["&#", "<!entity", "foreignobject"]
-        .iter()
-        .any(|blocked| lower.contains(blocked))
-        || compact.contains("javascript:")
-    {
+    if text.len() > MAX_SVG_BYTES || refuses_dtd(text) {
         return false;
     }
-    // `<script` in any namespace (`<svg:script`).
-    let script = lower.match_indices("script").any(|(index, _)| {
-        matches!(
-            lower.as_bytes().get(index.wrapping_sub(1)),
-            Some(b'<' | b':')
-        )
-    });
-    !script && !event_attribute(&lower)
+    let Some(document) = parse_svg(text) else {
+        return false;
+    };
+    // `<?xml-stylesheet?>` and friends fetch external resources.
+    if document.descendants().any(|node| node.is_pi()) {
+        return false;
+    }
+    document
+        .descendants()
+        .filter(roxmltree::Node::is_element)
+        .all(|element| {
+            let name = element.tag_name();
+            matches!(name.namespace(), None | Some(SVG_NAMESPACE))
+                && SAFE_SVG_ELEMENTS.contains(&name.name())
+                && element
+                    .attributes()
+                    .all(|attribute| attribute_is_safe(&attribute))
+        })
+}
+
+/// Whether one attribute of an allowed element stays inside the document.
+fn attribute_is_safe(attribute: &roxmltree::Attribute<'_, '_>) -> bool {
+    let name = attribute.name();
+    // Event handlers, whatever their namespace (`onload`, `xlink:onload`).
+    if name.len() >= 2 && name.as_bytes()[..2].eq_ignore_ascii_case(b"on") {
+        return false;
+    }
+    // CSS can fetch (`url()`, `@import`) and a drawing does not need it.
+    if name.eq_ignore_ascii_case("style") {
+        return false;
+    }
+    let value = attribute.value();
+    // CSS escapes (`u\72l(`) reassemble a `url(` after the literal check below,
+    // and no drawing attribute needs a backslash.
+    if value.contains('\\') {
+        return false;
+    }
+    // Browsers drop whitespace and control characters inside a URL scheme.
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && !character.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if compact.contains("javascript:") {
+        return false;
+    }
+    // `href` and `xlink:href` may only name a fragment of this document.
+    if name.eq_ignore_ascii_case("href") && !value.trim_start().starts_with('#') {
+        return false;
+    }
+    // Every `url(...)` must be an internal `url(#id)`.
+    let mut rest = compact.as_str();
+    while let Some(index) = rest.find("url(") {
+        let target = rest[index + 4..].trim_start_matches(['"', '\'']);
+        if !target.starts_with('#') {
+            return false;
+        }
+        rest = &rest[index + 4..];
+    }
+    true
 }
 
 /// Add `width`/`height` to an SVG root that only declares a `viewBox`.
 ///
 /// This edits the root start tag as a string; nothing else in the document is
-/// parsed or changed. A root that already has both dimensions is returned
-/// unchanged, and a root with neither dimensions nor a usable `viewBox` is an
-/// error.
+/// parsed or changed. The root element is located through the XML parser, so a
+/// comment or the prolog cannot stand in for it. A root that already has both
+/// dimensions is returned unchanged, and a root with neither dimensions nor a
+/// usable `viewBox` is an error. Like [`svg_is_safe`], this refuses a document
+/// over [`MAX_SVG_BYTES`] or one that declares DTD markup, an internal subset,
+/// or an unreadable prolog.
 pub fn svg_with_size(text: &str) -> Result<String> {
-    let (tag, start) =
+    if text.len() > MAX_SVG_BYTES {
+        return Err(Error::Invalid(format!(
+            "SVG is larger than {MAX_SVG_BYTES} bytes"
+        )));
+    }
+    if refuses_dtd(text) {
+        return Err(Error::Invalid(
+            "SVG declares an internal DTD subset".to_string(),
+        ));
+    }
+    let (tag, _, name_end) =
         root_tag(text).ok_or_else(|| Error::Invalid("SVG has no <svg> root tag".to_string()))?;
     let has_width = attribute(tag, "width").is_some();
     let has_height = attribute(tag, "height").is_some();
@@ -508,14 +730,14 @@ pub fn svg_with_size(text: &str) -> Result<String> {
     }
     let (width, height) = (numbers[2], numbers[3]);
     let mut sized = String::with_capacity(text.len() + 32);
-    sized.push_str(&text[..start + "<svg".len()]);
+    sized.push_str(&text[..name_end]);
     if !has_width {
         sized.push_str(&format!(" width=\"{width}\""));
     }
     if !has_height {
         sized.push_str(&format!(" height=\"{height}\""));
     }
-    sized.push_str(&text[start + "<svg".len()..]);
+    sized.push_str(&text[name_end..]);
     Ok(sized)
 }
 
@@ -702,22 +924,19 @@ fn magic_at(head: &[u8], offset: usize, magic: &[u8]) -> bool {
     head.get(offset..offset + magic.len()) == Some(magic)
 }
 
-fn event_attribute(lower: &str) -> bool {
-    lower.match_indices("on").any(|(index, _)| {
-        let boundary =
-            index == 0 || !matches!(lower.as_bytes()[index - 1], b'a'..=b'z' | b'0'..=b'9' | b'-');
-        if !boundary {
-            return false;
-        }
-        let rest = &lower[index + 2..];
-        let letters = rest.bytes().take_while(u8::is_ascii_lowercase).count();
-        letters > 0 && rest[letters..].trim_start().starts_with('=')
-    })
-}
-
-/// The root `<svg ...` start tag without its closing `>`, and its offset.
-fn root_tag(text: &str) -> Option<(&str, usize)> {
-    let start = text.find("<svg")?;
+/// The root start tag without its closing `>`, its offset, and the offset just
+/// past its (possibly prefixed) name.
+fn root_tag(text: &str) -> Option<(&str, usize, usize)> {
+    let document = parse_svg(text)?;
+    let start = document.root_element().range().start;
+    let bytes = text.as_bytes();
+    let mut name_end = start + 1;
+    while name_end < bytes.len()
+        && !bytes[name_end].is_ascii_whitespace()
+        && !matches!(bytes[name_end], b'/' | b'>')
+    {
+        name_end += 1;
+    }
     let mut quote = None;
     for (offset, character) in text[start..].char_indices() {
         match quote {
@@ -728,7 +947,7 @@ fn root_tag(text: &str) -> Option<(&str, usize)> {
             }
             None => match character {
                 '"' | '\'' => quote = Some(character),
-                '>' => return Some((&text[start..start + offset], start)),
+                '>' => return Some((&text[start..start + offset], start, name_end)),
                 _ => {}
             },
         }
@@ -739,7 +958,14 @@ fn root_tag(text: &str) -> Option<(&str, usize)> {
 /// One attribute of a start tag: `Some(None)` when it has no value.
 fn attribute<'a>(tag: &'a str, name: &str) -> Option<Option<&'a str>> {
     let bytes = tag.as_bytes();
-    let mut index = "<svg".len();
+    // Skip `<` and the tag name, which may be prefixed (`<s:svg`).
+    let mut index = 1;
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !matches!(bytes[index], b'/' | b'>')
+    {
+        index += 1;
+    }
     while index < bytes.len() {
         while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
             index += 1;
