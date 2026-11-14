@@ -496,9 +496,15 @@ const SAFE_SVG_ELEMENTS: &[&str] = &[
     "use",
 ];
 
+/// Largest SVG upload the validator reads, in bytes.
+///
+/// A drawing is a few hundred kilobytes at most, and parsing is work
+/// proportional to the input, so a larger file is refused before it is parsed.
+pub const MAX_SVG_BYTES: usize = 8 * 1024 * 1024;
+
 /// Parse `text` as an XML document, keeping DTDs so a benign doctype still
-/// converts. Declared entities are expanded, which is what lets the value
-/// checks see an entity that spells `javascript:`.
+/// converts. An internal subset never reaches this function: see
+/// [`has_internal_dtd_subset`].
 fn parse_svg(text: &str) -> Option<roxmltree::Document<'_>> {
     roxmltree::Document::parse_with_options(
         text,
@@ -510,14 +516,65 @@ fn parse_svg(text: &str) -> Option<roxmltree::Document<'_>> {
     .ok()
 }
 
+/// Whether the prolog declares a doctype with an internal subset.
+///
+/// An internal subset is the parser's blind spot: `<!ATTLIST ...>` defaults are
+/// applied by browsers but not by roxmltree, so a defaulted `onload` would never
+/// be seen, and expanding declared entities is unbounded work. Both only exist
+/// inside `<!DOCTYPE ... [ ... ]>`, so the raw text is checked before anything
+/// parses or expands. A plain doctype without a subset stays allowed.
+fn has_internal_dtd_subset(text: &str) -> bool {
+    let mut rest = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("<?") {
+            let Some(end) = after.find("?>") else {
+                return false;
+            };
+            rest = after[end + 2..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            let Some(end) = after.find("-->") else {
+                return false;
+            };
+            rest = after[end + 3..].trim_start();
+        } else if rest
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
+        {
+            let mut quote = None;
+            for character in rest.chars() {
+                match quote {
+                    Some(delimiter) => {
+                        if character == delimiter {
+                            quote = None;
+                        }
+                    }
+                    None => match character {
+                        '"' | '\'' => quote = Some(character),
+                        '[' => return true,
+                        '>' => return false,
+                        _ => {}
+                    },
+                }
+            }
+            return false;
+        } else {
+            return false;
+        }
+    }
+}
+
 /// Whether an SVG is safe to hand to a browser.
 ///
-/// The document must parse as XML, every element must be in the SVG namespace
-/// (or no namespace, for the common xmlns-less file) and be one of the allowed
-/// drawing elements, and every attribute must avoid script and network reach:
-/// no `on*` handlers, no `style`, no `javascript:` value, and no `href` or
-/// `url()` pointing outside the document.
+/// The document must fit [`MAX_SVG_BYTES`], declare no internal DTD subset, and
+/// parse as XML. Every element must be in the SVG namespace (or no namespace,
+/// for the common xmlns-less file) and be one of the allowed drawing elements,
+/// and every attribute must avoid script and network reach: no `on*` handlers,
+/// no `style`, no `javascript:` value, no CSS escapes, and no `href` or `url()`
+/// pointing outside the document.
 pub fn svg_is_safe(text: &str) -> bool {
+    if text.len() > MAX_SVG_BYTES || has_internal_dtd_subset(text) {
+        return false;
+    }
     let Some(document) = parse_svg(text) else {
         return false;
     };
@@ -550,6 +607,11 @@ fn attribute_is_safe(attribute: &roxmltree::Attribute<'_, '_>) -> bool {
         return false;
     }
     let value = attribute.value();
+    // CSS escapes (`u\72l(`) reassemble a `url(` after the literal check below,
+    // and no drawing attribute needs a backslash.
+    if value.contains('\\') {
+        return false;
+    }
     // Browsers drop whitespace and control characters inside a URL scheme.
     let compact: String = value
         .chars()
@@ -581,8 +643,19 @@ fn attribute_is_safe(attribute: &roxmltree::Attribute<'_, '_>) -> bool {
 /// parsed or changed. The root element is located through the XML parser, so a
 /// comment or the prolog cannot stand in for it. A root that already has both
 /// dimensions is returned unchanged, and a root with neither dimensions nor a
-/// usable `viewBox` is an error.
+/// usable `viewBox` is an error. Like [`svg_is_safe`], this refuses a document
+/// over [`MAX_SVG_BYTES`] or one with an internal DTD subset.
 pub fn svg_with_size(text: &str) -> Result<String> {
+    if text.len() > MAX_SVG_BYTES {
+        return Err(Error::Invalid(format!(
+            "SVG is larger than {MAX_SVG_BYTES} bytes"
+        )));
+    }
+    if has_internal_dtd_subset(text) {
+        return Err(Error::Invalid(
+            "SVG declares an internal DTD subset".to_string(),
+        ));
+    }
     let (tag, _, name_end) =
         root_tag(text).ok_or_else(|| Error::Invalid("SVG has no <svg> root tag".to_string()))?;
     let has_width = attribute(tag, "width").is_some();

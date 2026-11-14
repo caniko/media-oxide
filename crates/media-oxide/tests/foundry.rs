@@ -9,7 +9,7 @@ use std::path::Path;
 
 use media_oxide::foundry::{
     allowed_upload, convert, needs_probe, normalize_stem, plan, sniff_matches, svg_is_safe,
-    svg_with_size, Action, AssetKind, AudioCodec, Error, Options, Plan, Probe,
+    svg_with_size, Action, AssetKind, AudioCodec, Error, Options, Plan, Probe, MAX_SVG_BYTES,
 };
 
 fn options() -> Options {
@@ -370,6 +370,64 @@ fn script_reach_in_attributes_is_rejected() {
     assert!(!svg_is_safe(
         r#"<?xml-stylesheet href="https://example.invalid/a.css"?><svg xmlns="http://www.w3.org/2000/svg"/>"#
     ));
+}
+
+#[test]
+fn css_escapes_in_attribute_values_are_rejected() {
+    // `u\72l(` is `url(` to a CSS parser but not to a literal search.
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="u\72l(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="\75rl(https://example.invalid/a.svg#x)"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(#g\)"/></svg>"#
+    ));
+}
+
+#[test]
+fn internal_dtd_subsets_are_refused_before_parsing() {
+    // A defaulted event handler lives in the subset, where roxmltree cannot see
+    // it and Chromium applies it.
+    assert!(!svg_is_safe(
+        r#"<!DOCTYPE svg [<!ATTLIST svg onload CDATA "alert(1)">]><svg/>"#
+    ));
+    assert!(!svg_is_safe(
+        r#"<!DOCTYPE svg [<!ENTITY js "javascript:">]><svg><a href="&js;"/></svg>"#
+    ));
+    assert!(!svg_is_safe(
+        "<!-- <!DOCTYPE svg [<!ENTITY a \"x\">]> --><!DOCTYPE svg [<!ENTITY b \"y\">]><svg/>"
+    ));
+    // A doctype without a subset is still a plain document.
+    assert!(svg_is_safe(
+        r#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg width="1" height="1"/>"#
+    ));
+}
+
+#[test]
+fn entity_bombs_and_oversized_documents_are_rejected_quickly() {
+    // Nothing is expanded: the subset is refused from the raw text.
+    let mut bomb = String::from(r#"<!DOCTYPE svg [<!ENTITY a "lollollollollollol">"#);
+    for level in 1..24 {
+        bomb.push_str(&format!(
+            r#"<!ENTITY l{level} "{}">"#,
+            format!("&l{};", level - 1).repeat(10)
+        ));
+    }
+    bomb.push_str("]><svg>&l23;</svg>");
+    let started = std::time::Instant::now();
+    assert!(!svg_is_safe(&bomb));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "the bomb took {:?}",
+        started.elapsed()
+    );
+
+    let mut oversized = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#);
+    oversized.push_str(&"a".repeat(MAX_SVG_BYTES));
+    assert!(!svg_is_safe(&oversized));
+    assert!(matches!(svg_with_size(&oversized), Err(Error::Invalid(_))));
 }
 
 #[test]
