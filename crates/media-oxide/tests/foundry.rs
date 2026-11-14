@@ -431,6 +431,35 @@ fn entity_bombs_and_oversized_documents_are_rejected_quickly() {
 }
 
 #[test]
+fn quoted_xml_declaration_cannot_hide_an_entity_subset() {
+    // `?>` inside the quoted version value used to end the prolog scan early,
+    // so the subset below was never inspected while roxmltree expanded it:
+    // ~22 KB of text becoming 16 MiB, through both entry points.
+    let mut bomb = String::from(r#"<?xml version="1.0?>"?>"#);
+    bomb.push_str(r#"<!DOCTYPE svg [<!ENTITY a ""#);
+    bomb.push_str(&"x".repeat(2_580));
+    bomb.push_str(r#"">]>"#);
+    bomb.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>"#);
+    bomb.push_str(&"&a;".repeat(6_500));
+    bomb.push_str("</text></svg>");
+    assert!(bomb.len() < 64 * 1024, "reproducer is {} bytes", bomb.len());
+
+    let started = std::time::Instant::now();
+    assert!(!svg_is_safe(&bomb), "the declaration bypass was accepted");
+    assert!(
+        matches!(svg_with_size(&bomb), Err(Error::Invalid(_))),
+        "the declaration bypass was accepted for sizing"
+    );
+    // Rejection is a scan of the raw text; expanding the subset takes hundreds
+    // of milliseconds and 16 MiB even in a debug build.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "the declaration bypass took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn plain_drawing_svg_still_passes() {
     assert!(svg_is_safe(
         r##"<?xml version="1.0" encoding="UTF-8"?>

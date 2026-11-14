@@ -503,37 +503,88 @@ const SAFE_SVG_ELEMENTS: &[&str] = &[
 pub const MAX_SVG_BYTES: usize = 8 * 1024 * 1024;
 
 /// Parse `text` as an XML document, keeping DTDs so a benign doctype still
-/// converts. An internal subset never reaches this function: see
-/// [`has_internal_dtd_subset`].
+/// converts. DTD markup never reaches this function: see [`refuses_dtd`]. The
+/// node limit bounds the tree even for a document with no DTD at all.
 fn parse_svg(text: &str) -> Option<roxmltree::Document<'_>> {
     roxmltree::Document::parse_with_options(
         text,
         roxmltree::ParsingOptions {
             allow_dtd: true,
+            nodes_limit: 100_000,
             ..roxmltree::ParsingOptions::default()
         },
     )
     .ok()
 }
 
-/// Whether the prolog declares a doctype with an internal subset.
+/// Whether `text` declares DTD markup an internal subset would carry.
 ///
-/// An internal subset is the parser's blind spot: `<!ATTLIST ...>` defaults are
-/// applied by browsers but not by roxmltree, so a defaulted `onload` would never
-/// be seen, and expanding declared entities is unbounded work. Both only exist
-/// inside `<!DOCTYPE ... [ ... ]>`, so the raw text is checked before anything
-/// parses or expands. A plain doctype without a subset stays allowed.
-fn has_internal_dtd_subset(text: &str) -> bool {
+/// `<!ENTITY>`, `<!ATTLIST>`, `<!ELEMENT>` and `<!NOTATION>` only occur inside an
+/// internal subset, and matching them on the raw text cannot be bypassed by
+/// escaping, quoting or a malformed declaration. A false positive inside a
+/// comment only refuses a file that declared nothing.
+fn declares_dtd_markup(text: &str) -> bool {
+    const DECLARATIONS: [&str; 4] = ["<!ENTITY", "<!ATTLIST", "<!ELEMENT", "<!NOTATION"];
+    let bytes = text.as_bytes();
+    DECLARATIONS.iter().any(|declaration| {
+        bytes
+            .windows(declaration.len())
+            .any(|window| window.eq_ignore_ascii_case(declaration.as_bytes()))
+    })
+}
+
+/// Offset just past a `<? ... ?>` instruction, tracking quotes inside it.
+///
+/// A quoted pseudo-attribute may contain `?>` (`<?xml version="1.0?>"?>`), so
+/// the terminator only counts outside quotes. `None` means the instruction does
+/// not terminate: a declaration that cannot be read cannot be trusted.
+fn instruction_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 2;
+    let mut quote = None;
+    while index < bytes.len() {
+        match quote {
+            Some(delimiter) => {
+                if bytes[index] == delimiter {
+                    quote = None;
+                }
+                index += 1;
+            }
+            None => match bytes[index] {
+                b'"' | b'\'' => {
+                    quote = Some(bytes[index]);
+                    index += 1;
+                }
+                b'?' if bytes.get(index + 1) == Some(&b'>') => return Some(index + 2),
+                _ => index += 1,
+            },
+        }
+    }
+    None
+}
+
+/// Whether the document declares DTD markup, an internal subset, or a prolog
+/// that cannot be read.
+///
+/// An internal subset is the validator's blind spot: `<!ATTLIST ...>` defaults
+/// are applied by browsers but not by roxmltree, so a defaulted `onload` would
+/// never be seen, and declared entities are expanded during parsing. The raw
+/// text is checked before anything parses or expands, and a plain doctype
+/// without a subset stays allowed.
+fn refuses_dtd(text: &str) -> bool {
+    if declares_dtd_markup(text) {
+        return true;
+    }
     let mut rest = text.trim_start_matches('\u{feff}').trim_start();
     loop {
-        if let Some(after) = rest.strip_prefix("<?") {
-            let Some(end) = after.find("?>") else {
-                return false;
+        if rest.starts_with("<?") {
+            let Some(end) = instruction_end(rest) else {
+                return true;
             };
-            rest = after[end + 2..].trim_start();
+            rest = rest[end..].trim_start();
         } else if let Some(after) = rest.strip_prefix("<!--") {
             let Some(end) = after.find("-->") else {
-                return false;
+                return true;
             };
             rest = after[end + 3..].trim_start();
         } else if rest
@@ -556,7 +607,7 @@ fn has_internal_dtd_subset(text: &str) -> bool {
                     },
                 }
             }
-            return false;
+            return true;
         } else {
             return false;
         }
@@ -565,14 +616,14 @@ fn has_internal_dtd_subset(text: &str) -> bool {
 
 /// Whether an SVG is safe to hand to a browser.
 ///
-/// The document must fit [`MAX_SVG_BYTES`], declare no internal DTD subset, and
-/// parse as XML. Every element must be in the SVG namespace (or no namespace,
-/// for the common xmlns-less file) and be one of the allowed drawing elements,
-/// and every attribute must avoid script and network reach: no `on*` handlers,
-/// no `style`, no `javascript:` value, no CSS escapes, and no `href` or `url()`
-/// pointing outside the document.
+/// The document must fit [`MAX_SVG_BYTES`], declare no DTD markup or internal
+/// subset, and parse as XML. Every element must be in the SVG namespace (or no
+/// namespace, for the common xmlns-less file) and be one of the allowed drawing
+/// elements, and every attribute must avoid script and network reach: no `on*`
+/// handlers, no `style`, no `javascript:` value, no CSS escapes, and no `href`
+/// or `url()` pointing outside the document.
 pub fn svg_is_safe(text: &str) -> bool {
-    if text.len() > MAX_SVG_BYTES || has_internal_dtd_subset(text) {
+    if text.len() > MAX_SVG_BYTES || refuses_dtd(text) {
         return false;
     }
     let Some(document) = parse_svg(text) else {
@@ -644,14 +695,15 @@ fn attribute_is_safe(attribute: &roxmltree::Attribute<'_, '_>) -> bool {
 /// comment or the prolog cannot stand in for it. A root that already has both
 /// dimensions is returned unchanged, and a root with neither dimensions nor a
 /// usable `viewBox` is an error. Like [`svg_is_safe`], this refuses a document
-/// over [`MAX_SVG_BYTES`] or one with an internal DTD subset.
+/// over [`MAX_SVG_BYTES`] or one that declares DTD markup, an internal subset,
+/// or an unreadable prolog.
 pub fn svg_with_size(text: &str) -> Result<String> {
     if text.len() > MAX_SVG_BYTES {
         return Err(Error::Invalid(format!(
             "SVG is larger than {MAX_SVG_BYTES} bytes"
         )));
     }
-    if has_internal_dtd_subset(text) {
+    if refuses_dtd(text) {
         return Err(Error::Invalid(
             "SVG declares an internal DTD subset".to_string(),
         ));
