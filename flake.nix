@@ -75,10 +75,13 @@
         ];
 
         # Encoders are driven as CLIs: libjxl's cjxl and the ffmpeg build Immich
-        # itself uses, which carries SVT-AV1 and libvmaf.
+        # itself uses, which carries SVT-AV1 and libvmaf. nixpkgs `ffmpeg` is
+        # listed too because the Foundry asset path and its tests use libwebp,
+        # libvpx-vp9, libvorbis, and libopus.
         mediaTools = with pkgs; [
           libjxl
           jellyfin-ffmpeg
+          ffmpeg
         ];
 
         # Keep the derivation's pkg-config environment explicit. The fallback

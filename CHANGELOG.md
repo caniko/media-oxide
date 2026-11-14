@@ -4,6 +4,8 @@
 
 ### Changed
 
+- The `media-oxide` crate is now licensed `MIT OR Apache-2.0`, so permissively
+  licensed tools can link it. The rest of the workspace stays `AGPL-3.0-only`.
 - The workspace is renamed to `media-oxide` after its shared crate. The
   `rs-immicher-oxide-*` crate names, the CLI binary, the NixOS module, and the
   flake output attributes are unchanged, so existing hosts keep working.
@@ -34,6 +36,11 @@
 
 ### Added
 
+- The `foundry` feature in `media-oxide`: the Foundry VTT conversion policy for
+  tokens, maps, tiles, artwork, and audio. It plans and runs `ffmpeg`
+  (`libwebp`, `libvpx-vp9`, `libvorbis`, `libopus`) conversions, normalizes file
+  names, sizes SVGs, and offers process-free `allowed_upload` and
+  `sniff_matches` checks for server-side validation.
 - `media-oxide`, a shared crate for JPEG XL encoding through `cjxl`,
   container metadata stripping, and optional jxl-oxide decoding, validation,
   header dimensions, and progressive-preview cuts. `rs-immicher-oxide-codec-jxl`
