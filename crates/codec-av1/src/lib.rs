@@ -321,7 +321,9 @@ fn probe_timeline(input: &Path) -> Result<Timeline> {
 }
 
 /// End of playback in seconds: the container duration, which covers every
-/// stream, so a still final frame is held for any remaining audio.
+/// stream, so a still final frame is held for any remaining audio. A container
+/// that does not state it (a stream-written MKV) keeps the original: without
+/// it, a damaged last frame could hide behind an audio tail.
 fn playback_end(input: &Path) -> Result<f64> {
     let out = run_tool(
         Command::new("ffprobe")
@@ -329,12 +331,17 @@ fn playback_end(input: &Path) -> Result<f64> {
             .args(["-of", "default=noprint_wrappers=1:nokey=1"])
             .arg(input),
     )?;
-    Ok(String::from_utf8_lossy(&out)
-        .trim()
+    let text = String::from_utf8_lossy(&out);
+    text.trim()
         .parse::<f64>()
         .ok()
-        .filter(|d| d.is_finite())
-        .unwrap_or(0.0))
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .ok_or_else(|| {
+            PipelineError::Keep(format!(
+                "source has no playback duration ({:?})",
+                text.trim()
+            ))
+        })
 }
 
 /// VMAF of `distorted` against `reference`, both decoded with their display
@@ -636,6 +643,26 @@ mod tests {
         let score = score_vmaf(&damaged, &src, &dir.path().join("vmaf.json")).unwrap();
         assert!(score.mean >= 95.0 && score.p1 >= 90.0, "{score}");
         assert!(!score.passes(95.0), "{score}");
+    }
+
+    /// A stream-written container states no duration, so the final frame's
+    /// hold is unknown; that must keep the original.
+    #[test]
+    fn unknown_playback_end_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stream.mkv");
+        let out = run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=320x240:rate=30:duration=1")
+                .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                .args(["-f", "matroska", "-"]),
+        )
+        .unwrap();
+        std::fs::write(&src, out).unwrap();
+        assert!(matches!(playback_end(&src), Err(PipelineError::Keep(_))));
+        let result = score_vmaf(&src, &src, &dir.path().join("vmaf.json"));
+        assert!(matches!(result, Err(PipelineError::Keep(_))), "{result:?}");
     }
 
     #[tokio::test]
