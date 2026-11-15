@@ -165,8 +165,11 @@ for frame. HDR colour tags, creation time, and the
 Apple location/make/model keys are kept; the display rotation is applied to the
 pixels. Audio becomes 192 kb/s Opus. Sources already in AV1 are kept.
 
-Every replacement must be at most 90% of the original's size, and every video
-encode must reach a mean VMAF of 95 (`--video-min-vmaf`) against its source.
+Every replacement must be at most 90% of the original's size. Every video
+encode is scored with VMAF against its source, frame for frame, using Netflix's
+4K model for 4K sources. It must reach a mean of 95 (`--video-min-vmaf`), and
+both its worst 1% of frames and its worst one-second window must reach 90.
+Its frame count must equal the source's.
 An original that fails either check, or that the encoder cannot read, is kept
 and recorded in the state file so it is not retried.
 

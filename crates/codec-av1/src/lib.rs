@@ -16,16 +16,19 @@ use rs_immicher_oxide_core::types::{
 /// The display rotation is applied to the pixels, container metadata
 /// (creation time, Apple location/make/model keys) is copied, and audio is
 /// re-encoded to transparent-rate Opus. Every encode is scored against its
-/// source with VMAF. The first encode uses `crf`; while it scores below
-/// `min_vmaf`, the encode is retried at a CRF lowered by [`CRF_STEP`], up to
-/// [`CRF_ATTEMPTS`] encodes in total. If none pass, the original is kept.
-/// So the cheapest replacement that clears the floor wins.
+/// source with VMAF, frame for frame. It passes when the mean reaches
+/// `min_vmaf` and both the worst 1% of frames and the worst one-second window
+/// reach `min_vmaf - LOW_TAIL_MARGIN`. The first encode uses `crf`. While an
+/// encode fails, it is retried at a CRF lowered by [`CRF_STEP`], up to
+/// [`CRF_ATTEMPTS`] encodes in total. If none pass, the original is kept, so
+/// the highest CRF that clears the floors wins.
 pub struct SvtAv1UhqTranscoder {
     /// First (highest) CRF tried (0-63, lower = better quality).
     crf: u32,
     /// SVT-AV1 preset (0-13, lower = slower/smaller).
     preset: u32,
-    /// Minimum mean VMAF a replacement must reach.
+    /// Minimum mean VMAF a replacement must reach; the low tail may sit
+    /// [`LOW_TAIL_MARGIN`] below it.
     min_vmaf: f64,
 }
 
@@ -58,8 +61,10 @@ impl SvtAv1UhqTranscoder {
                 .arg(input)
                 .args(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0"])
                 // Phones record variable frame rate; keep every frame and its
-                // timestamp so the encode stays 1:1 with the source.
-                .args(["-fps_mode", "passthrough"])
+                // timestamp (in the source's timebase) so the encode stays 1:1
+                // with the source. Passthrough alone still re-times frames
+                // onto the encoder's timebase and can collapse two of them.
+                .args(["-fps_mode", "passthrough", "-enc_time_base:v", "demux"])
                 .args(["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le"])
                 .args(["-preset", &self.preset.to_string()])
                 .args(["-crf", &crf.to_string()])
@@ -98,20 +103,119 @@ fn probe_video_codec(input: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
-/// Mean VMAF of `distorted` against `reference`, both decoded with their
-/// display rotation applied and compared at 10-bit.
+/// How far below `min_vmaf` the worst 1% of frames and the worst one-second
+/// window may fall. A mean alone passed five black frames in five seconds.
+pub const LOW_TAIL_MARGIN: f64 = 5.0;
+
+/// VMAF of an encode against its source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VmafScore {
+    mean: f64,
+    /// 1st-percentile frame score.
+    p1: f64,
+    /// Lowest mean over any one-second window of frames.
+    worst_second: f64,
+}
+
+impl VmafScore {
+    /// Whether the encode clears `min_vmaf` on average and in its low tail.
+    fn passes(&self, min_vmaf: f64) -> bool {
+        let tail = min_vmaf - LOW_TAIL_MARGIN;
+        self.mean >= min_vmaf && self.p1 >= tail && self.worst_second >= tail
+    }
+}
+
+impl std::fmt::Display for VmafScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "VMAF {:.2} (p1 {:.2}, worst second {:.2})",
+            self.mean, self.p1, self.worst_second
+        )
+    }
+}
+
+/// Summarise per-frame scores; `window` is the frame count of one second.
+fn summarize(frames: &[f64], window: usize) -> VmafScore {
+    let mean = frames.iter().sum::<f64>() / frames.len() as f64;
+    let mut sorted = frames.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let p1 = sorted[sorted.len() / 100];
+    let window = window.clamp(1, frames.len());
+    let worst_second = frames
+        .windows(window)
+        .map(|w| w.iter().sum::<f64>() / window as f64)
+        .fold(f64::INFINITY, f64::min);
+    VmafScore {
+        mean,
+        p1,
+        worst_second,
+    }
+}
+
+/// Decoded frame count, average frame rate and coded size of the first video
+/// stream. Counting decodes the whole stream: packet counts differ from
+/// presented frames under edit lists and discarded packets.
+fn probe_frames(input: &Path) -> Result<(usize, f64, u32, u32)> {
+    let out = run_tool(
+        Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-count_frames"])
+            .args([
+                "-show_entries",
+                "stream=nb_read_frames,avg_frame_rate,width,height",
+            ])
+            .args(["-of", "default=noprint_wrappers=1"])
+            .arg(input),
+    )?;
+    let text = String::from_utf8_lossy(&out);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or("")
+    };
+    let bad = |what: &str| PipelineError::Transcoder(format!("ffprobe reported no {what}").into());
+    let frames = field("nb_read_frames")
+        .parse()
+        .map_err(|_| bad("frame count"))?;
+    let fps = match field("avg_frame_rate").split_once('/') {
+        Some((n, d)) => n.parse::<f64>().unwrap_or(0.0) / d.parse::<f64>().unwrap_or(0.0),
+        None => 0.0,
+    };
+    let width = field("width").parse().map_err(|_| bad("width"))?;
+    let height = field("height").parse().map_err(|_| bad("height"))?;
+    Ok((frames, fps, width, height))
+}
+
+/// VMAF of `distorted` against `reference`, both decoded with their display
+/// rotation applied and compared at 10-bit, with Netflix's 4K model for 4K
+/// sources.
 ///
 /// Frames are paired by index, not timestamp: a variable-frame-rate source and
 /// its re-muxed encode round timestamps differently, and timestamp pairing then
 /// scores many frames against a neighbour (a 60 fps phone clip read VMAF ~54
-/// instead of ~95). The encode keeps frames 1:1, and a frame-count mismatch can
-/// only lower the score, so the gate still fails closed.
-fn mean_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<f64> {
+/// instead of ~95). Index pairing is only sound for equal streams, so both
+/// decoded frame counts and the scored frame count must match, and framesync
+/// may not repeat or extend frames. Any mismatch keeps the original.
+fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScore> {
+    let (ref_frames, fps, width, height) = probe_frames(reference)?;
+    let (enc_frames, ..) = probe_frames(distorted)?;
+    if ref_frames == 0 || enc_frames != ref_frames {
+        return Err(PipelineError::Keep(format!(
+            "encode has {enc_frames} frames, source has {ref_frames}"
+        )));
+    }
+
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let model = if width.max(height) >= 3840 {
+        ":model=version=vmaf_4k_v0.6.1"
+    } else {
+        ""
+    };
     let graph = format!(
         "[0:v]format=yuv420p10le,settb=1/1000,setpts=N[d];\
          [1:v]format=yuv420p10le,settb=1/1000,setpts=N[r];\
-         [d][r]libvmaf=n_threads={threads}:log_fmt=json:log_path={}",
+         [d][r]libvmaf=n_threads={threads}:shortest=1:repeatlast=0{model}:\
+         log_fmt=json:log_path={}",
         log.display()
     );
     run_tool(
@@ -125,9 +229,22 @@ fn mean_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<f64> {
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(log).map_err(PipelineError::Io)?)
             .map_err(|e| PipelineError::Transcoder(Box::new(e)))?;
-    json["pooled_metrics"]["vmaf"]["mean"]
-        .as_f64()
-        .ok_or_else(|| PipelineError::Transcoder("VMAF log has no pooled mean".into()))
+    let frames: Vec<f64> = json["frames"]
+        .as_array()
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(|f| f["metrics"]["vmaf"].as_f64())
+                .collect()
+        })
+        .unwrap_or_default();
+    if frames.len() != ref_frames {
+        return Err(PipelineError::Keep(format!(
+            "VMAF scored {} frames, source has {ref_frames}",
+            frames.len()
+        )));
+    }
+    Ok(summarize(&frames, fps.round() as usize))
 }
 
 #[async_trait]
@@ -184,23 +301,22 @@ impl Transcoder for SvtAv1UhqTranscoder {
             // A lower CRF only grows the file, so a miss here is final.
             require_saving(input_bytes, byte_count)?;
 
-            let vmaf = mean_vmaf(&output_path, &input_path, &tmp.path().join("vmaf.json"))?;
+            let vmaf = score_vmaf(&output_path, &input_path, &tmp.path().join("vmaf.json"))?;
             scored = Some((crf, vmaf, byte_count));
-            if vmaf >= self.min_vmaf {
+            if vmaf.passes(self.min_vmaf) {
                 break;
             }
         }
-        let Some((crf, vmaf, byte_count)) = scored.filter(|&(_, v, _)| v >= self.min_vmaf) else {
+        let Some((crf, vmaf, byte_count)) = scored.filter(|(_, v, _)| v.passes(self.min_vmaf))
+        else {
             let (crf, vmaf, _) = scored.expect("the CRF ladder is never empty");
             return Err(PipelineError::Keep(format!(
-                "VMAF {vmaf:.2} at CRF {crf} is below {:.2}",
-                self.min_vmaf
+                "{vmaf} at CRF {crf} misses the {:.2} floor (tail {:.2})",
+                self.min_vmaf,
+                self.min_vmaf - LOW_TAIL_MARGIN
             )));
         };
-        tracing::debug!(
-            "{} encoded {codec} to AV1 at CRF {crf}, VMAF {vmaf:.2}",
-            asset.id
-        );
+        tracing::debug!("{} encoded {codec} to AV1 at CRF {crf}, {vmaf}", asset.id);
 
         let elapsed = start.elapsed();
         Ok(TranscodedAsset {
@@ -220,7 +336,13 @@ impl Transcoder for SvtAv1UhqTranscoder {
                 input_bytes,
                 output_bytes: byte_count,
                 compression_ratio: byte_count as f64 / input_bytes.max(1) as f64,
-                encoder: format!("{} crf={crf} vmaf={vmaf:.2}", self.label()),
+                encoder: format!(
+                    "{} crf={crf} vmaf={:.2} p1={:.2} worst_second={:.2}",
+                    self.label(),
+                    vmaf.mean,
+                    vmaf.p1,
+                    vmaf.worst_second
+                ),
             },
         })
     }
@@ -252,12 +374,52 @@ mod tests {
         assert_eq!(crf_ladder(0), vec![0]);
     }
 
-    /// Variable-frame-rate sources (every phone clip) must be scored frame
-    /// for frame; timestamp pairing read this clip as VMAF ~82.
-    #[tokio::test]
-    async fn variable_frame_rate_source_passes_the_vmaf_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("vfr.mp4");
+    #[test]
+    fn low_tail_fails_an_encode_with_a_good_mean() {
+        // Five black frames in five seconds at 60 fps: the mean still clears 95.
+        let mut frames = vec![99.0; 300];
+        frames[100..105].fill(0.0);
+        let score = summarize(&frames, 60);
+        assert!(score.mean >= 95.0);
+        assert!(!score.passes(95.0), "{score}");
+        assert!(summarize(&[99.0; 300], 60).passes(95.0));
+    }
+
+    /// Presentation timestamps of the first video stream, in seconds.
+    fn frame_pts(path: &Path) -> Vec<f64> {
+        let out = run_tool(
+            Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0"])
+                .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+                .arg(path),
+        )
+        .unwrap();
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(|l| l.trim_end_matches(',').parse().unwrap())
+            .collect()
+    }
+
+    /// Audio start minus video start, in seconds.
+    fn av_offset(path: &Path) -> f64 {
+        let start = |stream: &str| -> f64 {
+            let out = run_tool(
+                Command::new("ffprobe")
+                    .args(["-v", "error", "-select_streams", stream])
+                    .args(["-show_entries", "stream=start_time"])
+                    .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+                    .arg(path),
+            )
+            .unwrap();
+            String::from_utf8_lossy(&out).trim().parse().unwrap()
+        };
+        start("a:0") - start("v:0")
+    }
+
+    /// A lossless 60-frame 60 fps clip whose timestamps jitter like a phone's
+    /// variable-frame-rate recording, with a sine audio track.
+    fn vfr_clip(dir: &Path) -> std::path::PathBuf {
+        let src = dir.join("vfr.mp4");
         run_tool(
             Command::new("ffmpeg")
                 .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
@@ -265,18 +427,71 @@ mod tests {
                     "testsrc2=size=320x240:rate=60:duration=1,noise=alls=6:allf=t,\
                      settb=1/90000,setpts=N*1497+mod(N\\,3)*400",
                 )
-                .args(["-fps_mode", "passthrough", "-enc_time_base", "1/90000"])
+                .args(["-f", "lavfi", "-i", "sine=f=440:d=1"])
+                .args(["-fps_mode", "passthrough", "-enc_time_base:v", "1/90000"])
                 .args(["-video_track_timescale", "90000"])
                 .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                .args(["-c:a", "aac"])
                 .arg(&src),
         )
         .unwrap();
+        src
+    }
 
-        SvtAv1UhqTranscoder::new(20)
+    /// Variable-frame-rate sources (every phone clip) must be scored frame
+    /// for frame (timestamp pairing read this clip as VMAF ~82) and keep their
+    /// cadence and audio sync.
+    #[tokio::test]
+    async fn variable_frame_rate_source_keeps_timing_and_passes_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = vfr_clip(dir.path());
+
+        let out = SvtAv1UhqTranscoder::new(20)
             .with_preset(10)
             .transcode(Box::new(std::fs::File::open(&src).unwrap()), &asset())
             .await
             .expect("a VFR encode passes the VMAF gate");
+        let TranscodedPayload::File { path, _guard } = out.payload else {
+            panic!("expected file payload");
+        };
+
+        let (want, got) = (frame_pts(&src), frame_pts(&path));
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert!((w - g).abs() < 1e-4, "frame at {w}s moved to {g}s");
+        }
+        assert!((av_offset(&src) - av_offset(&path)).abs() < 0.01);
+    }
+
+    /// Index pairing is only sound for equal frame counts; a missing or a
+    /// repeated frame must keep the original rather than score high.
+    #[test]
+    fn frame_count_mismatch_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = vfr_clip(dir.path());
+        let variants = [
+            ("short.mp4", vec!["-frames:v", "59"]),
+            ("long.mp4", vec!["-vf", "loop=loop=1:size=1:start=30"]),
+        ];
+        for (name, args) in variants {
+            let path = dir.path().join(name);
+            run_tool(
+                Command::new("ffmpeg")
+                    .args(["-nostdin", "-loglevel", "error", "-i"])
+                    .arg(&src)
+                    .args(&args)
+                    // Without passthrough, ffmpeg drops the repeated frame again.
+                    .args(["-fps_mode", "passthrough"])
+                    .args(["-an", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                    .arg(&path),
+            )
+            .unwrap();
+            let result = score_vmaf(&path, &src, &dir.path().join("vmaf.json"));
+            assert!(
+                matches!(result, Err(PipelineError::Keep(_))),
+                "{name}: {result:?}"
+            );
+        }
     }
 
     /// Needs `ffmpeg`/`ffprobe` with libx264, libsvtav1, and libvmaf on PATH
