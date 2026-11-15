@@ -121,7 +121,7 @@ CLI does not expose force-delete.
 Tune codecs:
 
 ```sh
-rs-immicher-oxide run --image-distance 1.0 --video-crf 20 --video-min-vmaf 95 --concurrency 2
+rs-immicher-oxide run --image-distance 1.0 --video-crf 28 --video-min-vmaf 95 --concurrency 2
 ```
 
 Poll for newly discoverable assets:
@@ -156,8 +156,12 @@ orientation, so dates, GPS, camera data, colour, and rotation survive. HEIC,
 AVIF, WebP, GIF, TIFF, and RAW are left alone: they are already efficient,
 cannot be read by `cjxl`, or carry gain maps, depth, or animation.
 
-Videos: H.264, HEVC, and VP9 are encoded by `ffmpeg` with SVT-AV1 at 10-bit,
-CRF 20 and the perceptual (VQ) tune. HDR colour tags, creation time, and the
+Videos: H.264, HEVC, and VP9 are encoded by `ffmpeg` with SVT-AV1 at 10-bit
+and the perceptual (VQ) tune. The first encode uses CRF 28 (`--video-crf`). If
+it scores below the VMAF floor, it is retried at CRF 24 and then 20, so each
+video gets the smallest file that still passes. Every frame and its timestamp
+are kept, so variable-frame-rate phone clips stay in sync and are scored frame
+for frame. HDR colour tags, creation time, and the
 Apple location/make/model keys are kept; the display rotation is applied to the
 pixels. Audio becomes 192 kb/s Opus. Sources already in AV1 are kept.
 

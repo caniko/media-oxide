@@ -16,9 +16,12 @@ use rs_immicher_oxide_core::types::{
 /// The display rotation is applied to the pixels, container metadata
 /// (creation time, Apple location/make/model keys) is copied, and audio is
 /// re-encoded to transparent-rate Opus. Every encode is scored against its
-/// source with VMAF; a replacement below `min_vmaf` keeps the original.
+/// source with VMAF. The first encode uses `crf`; while it scores below
+/// `min_vmaf`, the encode is retried at a CRF lowered by [`CRF_STEP`], up to
+/// [`CRF_ATTEMPTS`] encodes in total. If none pass, the original is kept.
+/// So the cheapest replacement that clears the floor wins.
 pub struct SvtAv1UhqTranscoder {
-    /// CRF value (0-63, lower = better quality).
+    /// First (highest) CRF tried (0-63, lower = better quality).
     crf: u32,
     /// SVT-AV1 preset (0-13, lower = slower/smaller).
     preset: u32,
@@ -48,15 +51,18 @@ impl SvtAv1UhqTranscoder {
         self
     }
 
-    fn encode(&self, input: &Path, output: &Path) -> Result<()> {
+    fn encode(&self, crf: u32, input: &Path, output: &Path) -> Result<()> {
         run_tool(
             Command::new("ffmpeg")
                 .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
                 .arg(input)
                 .args(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0"])
+                // Phones record variable frame rate; keep every frame and its
+                // timestamp so the encode stays 1:1 with the source.
+                .args(["-fps_mode", "passthrough"])
                 .args(["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le"])
                 .args(["-preset", &self.preset.to_string()])
-                .args(["-crf", &self.crf.to_string()])
+                .args(["-crf", &crf.to_string()])
                 .args(["-svtav1-params", "tune=0"])
                 .args(["-c:a", "libopus", "-b:a", "192k"])
                 .args(["-movflags", "+faststart+use_metadata_tags", "-f", "mp4"])
@@ -64,6 +70,20 @@ impl SvtAv1UhqTranscoder {
         )
         .map(drop)
     }
+}
+
+/// CRF decrease between encode attempts.
+pub const CRF_STEP: u32 = 4;
+/// Encodes tried per video before keeping the original.
+pub const CRF_ATTEMPTS: u32 = 3;
+
+/// CRFs tried in order, highest (smallest file) first.
+fn crf_ladder(start: u32) -> Vec<u32> {
+    let mut ladder: Vec<u32> = (0..CRF_ATTEMPTS)
+        .map(|i| start.saturating_sub(i * CRF_STEP))
+        .collect();
+    ladder.dedup();
+    ladder
 }
 
 /// Codec name of the first video stream, as reported by ffprobe.
@@ -80,11 +100,17 @@ fn probe_video_codec(input: &Path) -> Result<String> {
 
 /// Mean VMAF of `distorted` against `reference`, both decoded with their
 /// display rotation applied and compared at 10-bit.
+///
+/// Frames are paired by index, not timestamp: a variable-frame-rate source and
+/// its re-muxed encode round timestamps differently, and timestamp pairing then
+/// scores many frames against a neighbour (a 60 fps phone clip read VMAF ~54
+/// instead of ~95). The encode keeps frames 1:1, and a frame-count mismatch can
+/// only lower the score, so the gate still fails closed.
 fn mean_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<f64> {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let graph = format!(
-        "[0:v]format=yuv420p10le,setpts=PTS-STARTPTS[d];\
-         [1:v]format=yuv420p10le,setpts=PTS-STARTPTS[r];\
+        "[0:v]format=yuv420p10le,settb=1/1000,setpts=N[d];\
+         [1:v]format=yuv420p10le,settb=1/1000,setpts=N[r];\
          [d][r]libvmaf=n_threads={threads}:log_fmt=json:log_path={}",
         log.display()
     );
@@ -149,20 +175,32 @@ impl Transcoder for SvtAv1UhqTranscoder {
 
         // ffmpeg blocks this task's thread for the whole encode, which is
         // acceptable for the long-lived, low-concurrency video pipeline.
-        self.encode(&input_path, &output_path)?;
-        let byte_count = std::fs::metadata(&output_path)
-            .map_err(PipelineError::Io)?
-            .len();
-        require_saving(input_bytes, byte_count)?;
+        let mut scored = None;
+        for crf in crf_ladder(self.crf) {
+            self.encode(crf, &input_path, &output_path)?;
+            let byte_count = std::fs::metadata(&output_path)
+                .map_err(PipelineError::Io)?
+                .len();
+            // A lower CRF only grows the file, so a miss here is final.
+            require_saving(input_bytes, byte_count)?;
 
-        let vmaf = mean_vmaf(&output_path, &input_path, &tmp.path().join("vmaf.json"))?;
-        if vmaf < self.min_vmaf {
+            let vmaf = mean_vmaf(&output_path, &input_path, &tmp.path().join("vmaf.json"))?;
+            scored = Some((crf, vmaf, byte_count));
+            if vmaf >= self.min_vmaf {
+                break;
+            }
+        }
+        let Some((crf, vmaf, byte_count)) = scored.filter(|&(_, v, _)| v >= self.min_vmaf) else {
+            let (crf, vmaf, _) = scored.expect("the CRF ladder is never empty");
             return Err(PipelineError::Keep(format!(
-                "VMAF {vmaf:.2} is below {:.2}",
+                "VMAF {vmaf:.2} at CRF {crf} is below {:.2}",
                 self.min_vmaf
             )));
-        }
-        tracing::debug!("{} encoded {codec} to AV1, VMAF {vmaf:.2}", asset.id);
+        };
+        tracing::debug!(
+            "{} encoded {codec} to AV1 at CRF {crf}, VMAF {vmaf:.2}",
+            asset.id
+        );
 
         let elapsed = start.elapsed();
         Ok(TranscodedAsset {
@@ -182,7 +220,7 @@ impl Transcoder for SvtAv1UhqTranscoder {
                 input_bytes,
                 output_bytes: byte_count,
                 compression_ratio: byte_count as f64 / input_bytes.max(1) as f64,
-                encoder: format!("{} vmaf={vmaf:.2}", self.label()),
+                encoder: format!("{} crf={crf} vmaf={vmaf:.2}", self.label()),
             },
         })
     }
@@ -204,6 +242,41 @@ mod tests {
             checksum: None,
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn crf_ladder_steps_down_and_never_repeats() {
+        assert_eq!(crf_ladder(28), vec![28, 24, 20]);
+        assert_eq!(crf_ladder(5), vec![5, 1, 0]);
+        assert_eq!(crf_ladder(2), vec![2, 0]);
+        assert_eq!(crf_ladder(0), vec![0]);
+    }
+
+    /// Variable-frame-rate sources (every phone clip) must be scored frame
+    /// for frame; timestamp pairing read this clip as VMAF ~82.
+    #[tokio::test]
+    async fn variable_frame_rate_source_passes_the_vmaf_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vfr.mp4");
+        run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg(
+                    "testsrc2=size=320x240:rate=60:duration=1,noise=alls=6:allf=t,\
+                     settb=1/90000,setpts=N*1497+mod(N\\,3)*400",
+                )
+                .args(["-fps_mode", "passthrough", "-enc_time_base", "1/90000"])
+                .args(["-video_track_timescale", "90000"])
+                .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                .arg(&src),
+        )
+        .unwrap();
+
+        SvtAv1UhqTranscoder::new(20)
+            .with_preset(10)
+            .transcode(Box::new(std::fs::File::open(&src).unwrap()), &asset())
+            .await
+            .expect("a VFR encode passes the VMAF gate");
     }
 
     /// Needs `ffmpeg`/`ffprobe` with libx264, libsvtav1, and libvmaf on PATH
