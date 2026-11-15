@@ -56,8 +56,11 @@ impl SvtAv1UhqTranscoder {
     }
 
     fn encode(&self, crf: u32, input: &Path, output: &Path) -> Result<()> {
-        run_tool(
+        // Any decode error in a mapped stream (video or audio) keeps the
+        // original; SVT_LOG=1 limits SVT-AV1's own stderr chatter to errors.
+        run_clean(
             Command::new("ffmpeg")
+                .env("SVT_LOG", "1")
                 .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
                 .arg(input)
                 .args(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0"])
@@ -129,13 +132,32 @@ fn field<'a>(text: &'a str, key: &str) -> &'a str {
         .unwrap_or("")
 }
 
-/// Codec name and transfer characteristic of the first video stream.
-fn probe_video_codec(input: &Path) -> Result<(String, String)> {
-    let text = probe_stream(input, "codec_name,color_transfer")?;
+/// Codec name of the first video stream and, for HDR sources, why it is HDR.
+fn probe_video_codec(input: &Path) -> Result<(String, Option<String>)> {
+    let text = probe_stream(
+        input,
+        "codec_name,codec_tag_string,color_transfer:stream_side_data=side_data_type",
+    )?;
     Ok((
         field(&text, "codec_name").trim().to_string(),
-        field(&text, "color_transfer").trim().to_string(),
+        hdr_reason(&text),
     ))
+}
+
+/// Dolby Vision sample-entry tags; profile 5 carries no PQ/HLG transfer tag.
+const DOLBY_VISION_TAGS: &[&str] = &["dvh1", "dvhe", "dav1", "dva1", "dvav"];
+
+/// Why a probed stream counts as HDR, if it does.
+fn hdr_reason(probe: &str) -> Option<String> {
+    let transfer = field(probe, "color_transfer").trim();
+    let tag = field(probe, "codec_tag_string").trim();
+    if HDR_TRANSFERS.contains(&transfer) {
+        Some(format!("transfer {transfer}"))
+    } else if DOLBY_VISION_TAGS.contains(&tag) || probe.contains("DOVI") {
+        Some("Dolby Vision".to_string())
+    } else {
+        None
+    }
 }
 
 /// PQ and HLG transfers. VMAF's SDR models do not score them meaningfully,
@@ -220,39 +242,82 @@ fn summarize(frames: &[f64], durations: &[f64]) -> VmafScore {
     }
 }
 
-/// Display duration in seconds of every decoded frame of the first video
-/// stream, in presentation order. Decoding the whole stream also proves it
-/// decodes cleanly; packet counts differ from presented frames under edit
-/// lists and discarded packets.
-fn probe_frames(input: &Path) -> Result<Vec<f64>> {
+/// Presentation start and display duration, in seconds, of every decoded
+/// frame of the first video stream.
+#[derive(Debug, Clone, PartialEq)]
+struct Timeline {
+    pts: Vec<f64>,
+    durations: Vec<f64>,
+}
+
+/// Largest timing difference, in seconds, between a source frame and its
+/// encode. Real phone clips keep their timeline exactly.
+const TIMING_TOLERANCE: f64 = 0.002;
+
+impl Timeline {
+    /// End of the last frame.
+    fn end(&self) -> f64 {
+        self.pts.last().unwrap_or(&0.0) + self.durations.last().unwrap_or(&0.0)
+    }
+
+    /// Whether `other` shows the same frames at the same times for as long.
+    fn matches(&self, other: &Timeline) -> bool {
+        self.pts.len() == other.pts.len()
+            && self
+                .pts
+                .iter()
+                .zip(&other.pts)
+                .all(|(a, b)| (a - b).abs() <= TIMING_TOLERANCE)
+            && (self.end() - other.end()).abs() <= TIMING_TOLERANCE
+    }
+}
+
+/// Parse `pts,duration` lines. A frame without a finite timestamp keeps the
+/// original instead of being dropped: dropping it would let a short encode
+/// match a short count. A missing duration repeats the previous step.
+fn parse_timeline(text: &str) -> Result<Timeline> {
+    let mut pts = Vec::new();
+    let mut given = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.trim().trim_end_matches(',').split(',');
+        let t = parts.next().unwrap_or("").trim().parse::<f64>().ok();
+        let Some(t) = t.filter(|t| t.is_finite()) else {
+            return Err(PipelineError::Keep(format!(
+                "frame {} has no usable timestamp ({line:?})",
+                pts.len()
+            )));
+        };
+        pts.push(t);
+        given.push(
+            parts
+                .next()
+                .and_then(|d| d.trim().parse::<f64>().ok())
+                .filter(|d| d.is_finite() && *d >= 0.0),
+        );
+    }
+    let mut durations: Vec<f64> = pts.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+    if !pts.is_empty() {
+        let step = durations.last().copied().unwrap_or(0.0);
+        durations.push(given.last().copied().flatten().unwrap_or(step));
+    }
+    Ok(Timeline { pts, durations })
+}
+
+/// Decode every frame of the first video stream. Decoding the whole stream
+/// also proves it decodes cleanly; packet counts differ from presented frames
+/// under edit lists and discarded packets.
+fn probe_timeline(input: &Path) -> Result<Timeline> {
     let out = run_clean(
         Command::new("ffprobe")
             .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "frame=best_effort_timestamp_time"])
+            .args([
+                "-show_entries",
+                "frame=best_effort_timestamp_time,duration_time",
+            ])
             .args(["-of", "csv=p=0"])
             .arg(input),
     )?;
-    let pts: Vec<f64> = String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
-        .collect();
-    let format = run_tool(
-        Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration"])
-            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
-            .arg(input),
-    )?;
-    let end: f64 = String::from_utf8_lossy(&format)
-        .trim()
-        .parse()
-        .unwrap_or(0.0);
-    let mut durations: Vec<f64> = pts.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
-    if let Some(&last) = pts.last() {
-        // The last frame lasts until the container ends, or one typical frame.
-        let typical = durations.last().copied().unwrap_or(0.0);
-        durations.push(if end > last { end - last } else { typical });
-    }
-    Ok(durations)
+    parse_timeline(&String::from_utf8_lossy(&out))
 }
 
 /// VMAF of `distorted` against `reference`, both decoded with their display
@@ -263,16 +328,19 @@ fn probe_frames(input: &Path) -> Result<Vec<f64>> {
 /// its re-muxed encode round timestamps differently, and timestamp pairing then
 /// scores many frames against a neighbour (a 60 fps phone clip read VMAF ~54
 /// instead of ~95). Index pairing is only sound for equal streams, so both
-/// files must decode without errors, both decoded frame counts and the scored
-/// frame count must match, and framesync may not repeat or extend frames. Any
-/// mismatch keeps the original.
+/// files must decode without errors, show the same frames at the same times
+/// for the same length, the scored frame count must match, and framesync may
+/// not repeat or extend frames. Any mismatch keeps the original.
 fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScore> {
-    let durations = probe_frames(reference)?;
-    let enc_frames = probe_frames(distorted)?.len();
-    let ref_frames = durations.len();
-    if ref_frames == 0 || enc_frames != ref_frames {
+    let source = probe_timeline(reference)?;
+    let encode = probe_timeline(distorted)?;
+    let ref_frames = source.pts.len();
+    if ref_frames == 0 || !source.matches(&encode) {
         return Err(PipelineError::Keep(format!(
-            "encode has {enc_frames} frames, source has {ref_frames}"
+            "encode timeline ({} frames, ends {:.3}s) differs from the source ({ref_frames} frames, ends {:.3}s)",
+            encode.pts.len(),
+            encode.end(),
+            source.end()
         )));
     }
 
@@ -310,7 +378,7 @@ fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScor
             frames.len()
         )));
     }
-    Ok(summarize(&frames, &durations))
+    Ok(summarize(&frames, &source.durations))
 }
 
 #[async_trait]
@@ -348,16 +416,16 @@ impl Transcoder for SvtAv1UhqTranscoder {
         let input_bytes = std::io::copy(&mut input, &mut input_file).map_err(PipelineError::Io)?;
         drop(input_file);
 
-        let (codec, transfer) = probe_video_codec(&input_path)?;
+        let (codec, hdr) = probe_video_codec(&input_path)?;
         if codec.is_empty() || codec == "av1" {
             return Err(PipelineError::Keep(format!(
                 "source video codec is {:?}",
                 if codec.is_empty() { "none" } else { &codec }
             )));
         }
-        if HDR_TRANSFERS.contains(&transfer.as_str()) {
+        if let Some(hdr) = hdr {
             return Err(PipelineError::Keep(format!(
-                "HDR source ({transfer}) is outside the SDR VMAF gate"
+                "HDR source ({hdr}) is outside the SDR VMAF gate"
             )));
         }
 
@@ -469,6 +537,49 @@ mod tests {
         assert!(score.mean >= 95.0 && score.p1 >= 90.0, "{score}");
         assert!(score.worst_second < 1.0, "{score}");
         assert!(!score.passes(95.0));
+    }
+
+    #[test]
+    fn timestamps_must_all_parse() {
+        let ok = parse_timeline("0.000000,0.033333,\n0.033333,0.033333,\n").unwrap();
+        assert_eq!(ok.pts, vec![0.0, 0.033333]);
+        assert!((ok.end() - 0.066666).abs() < 1e-9);
+        // A missing duration repeats the previous step.
+        let step = parse_timeline("0.0,N/A\n0.5,N/A\n").unwrap();
+        assert_eq!(step.durations, vec![0.5, 0.5]);
+        for bad in ["0.0,0.03\nN/A,0.03\n", "0.0,0.03\ninf,0.03\n", ",0.03\n"] {
+            assert!(
+                matches!(parse_timeline(bad), Err(PipelineError::Keep(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timelines_must_match_in_frames_times_and_length() {
+        let source = parse_timeline("0.0,0.1\n0.1,0.1\n0.2,2.0\n").unwrap();
+        assert!(source.matches(&source.clone()));
+        // Same frames, but the last one cut from 2 s to 0.1 s of playback.
+        let shortened = parse_timeline("0.0,0.1\n0.1,0.1\n0.2,0.1\n").unwrap();
+        assert!(!source.matches(&shortened));
+        let shifted = parse_timeline("0.0,0.1\n0.15,0.05\n0.2,2.0\n").unwrap();
+        assert!(!source.matches(&shifted));
+        let short = parse_timeline("0.0,0.1\n0.1,2.1\n").unwrap();
+        assert!(!source.matches(&short));
+    }
+
+    #[test]
+    fn dolby_vision_and_hdr_transfers_count_as_hdr() {
+        let sdr = "codec_name=hevc\ncodec_tag_string=hvc1\ncolor_transfer=bt709\n\
+                   side_data_type=Display Matrix\n";
+        assert_eq!(hdr_reason(sdr), None);
+        let pq = "codec_name=hevc\ncodec_tag_string=hvc1\ncolor_transfer=smpte2084\n";
+        assert!(hdr_reason(pq).is_some());
+        let dv5_tag = "codec_name=hevc\ncodec_tag_string=dvh1\ncolor_transfer=unknown\n";
+        assert!(hdr_reason(dv5_tag).is_some());
+        let dv_side = "codec_name=hevc\ncodec_tag_string=hev1\ncolor_transfer=unknown\n\
+                       side_data_type=DOVI configuration record\n";
+        assert!(hdr_reason(dv_side).is_some());
     }
 
     #[tokio::test]
