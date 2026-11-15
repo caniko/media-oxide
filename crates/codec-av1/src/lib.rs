@@ -12,12 +12,13 @@ use rs_immicher_oxide_core::types::{
 /// SVT-AV1 transcoder driving the `ffmpeg` and `ffprobe` CLIs.
 ///
 /// Video is encoded 10-bit with SVT-AV1's perceptual (VQ) tune so 8-bit
-/// sources gain no banding and HDR (HLG/PQ) keeps its depth and colour tags.
+/// sources gain no banding. HDR (PQ/HLG) originals are kept: VMAF's SDR
+/// models cannot vouch for them.
 /// The display rotation is applied to the pixels, container metadata
 /// (creation time, Apple location/make/model keys) is copied, and audio is
 /// re-encoded to transparent-rate Opus. Every encode is scored against its
 /// source with VMAF, frame for frame. It passes when the mean reaches
-/// `min_vmaf` and both the worst 1% of frames and the worst one-second window
+/// `min_vmaf` and both the worst 1% of frames and the worst second of playback
 /// reach `min_vmaf - LOW_TAIL_MARGIN`. The first encode uses `crf`. While an
 /// encode fails, it is retried at a CRF lowered by [`CRF_STEP`], up to
 /// [`CRF_ATTEMPTS`] encodes in total. If none pass, the original is kept, so
@@ -91,17 +92,55 @@ fn crf_ladder(start: u32) -> Vec<u32> {
     ladder
 }
 
-/// Codec name of the first video stream, as reported by ffprobe.
-fn probe_video_codec(input: &Path) -> Result<String> {
+/// Run an ffmpeg tool that must neither fail nor report errors. ffprobe and
+/// ffmpeg exit 0 after skipping corrupt frames, and [`run_tool`] drops stderr
+/// on success, so `-v error` output is the only sign of a damaged stream.
+fn run_clean(cmd: &mut Command) -> Result<Vec<u8>> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| PipelineError::Transcoder(format!("failed to run {program}: {e}").into()))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || !stderr.trim().is_empty() {
+        return Err(PipelineError::Keep(format!(
+            "{program} did not decode cleanly: {}",
+            stderr.trim().lines().next().unwrap_or("non-zero exit")
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// `key=value` fields of a single ffprobe stream section.
+fn probe_stream(input: &Path, entries: &str) -> Result<String> {
     let out = run_tool(
         Command::new("ffprobe")
             .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "stream=codec_name"])
-            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .args(["-show_entries", &format!("stream={entries}")])
+            .args(["-of", "default=noprint_wrappers=1"])
             .arg(input),
     )?;
-    Ok(String::from_utf8_lossy(&out).trim().to_string())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
+
+fn field<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or("")
+}
+
+/// Codec name and transfer characteristic of the first video stream.
+fn probe_video_codec(input: &Path) -> Result<(String, String)> {
+    let text = probe_stream(input, "codec_name,color_transfer")?;
+    Ok((
+        field(&text, "codec_name").trim().to_string(),
+        field(&text, "color_transfer").trim().to_string(),
+    ))
+}
+
+/// PQ and HLG transfers. VMAF's SDR models do not score them meaningfully,
+/// and HDR10+/Dolby Vision metadata is invisible to a pixel comparison.
+const HDR_TRANSFERS: &[&str] = &["smpte2084", "arib-std-b67"];
 
 /// How far below `min_vmaf` the worst 1% of frames and the worst one-second
 /// window may fall. A mean alone passed five black frames in five seconds.
@@ -113,7 +152,7 @@ struct VmafScore {
     mean: f64,
     /// 1st-percentile frame score.
     p1: f64,
-    /// Lowest mean over any one-second window of frames.
+    /// Lowest display-time-weighted mean over any one second of playback.
     worst_second: f64,
 }
 
@@ -135,17 +174,45 @@ impl std::fmt::Display for VmafScore {
     }
 }
 
-/// Summarise per-frame scores; `window` is the frame count of one second.
-fn summarize(frames: &[f64], window: usize) -> VmafScore {
+/// Summarise per-frame scores. `durations` holds each frame's display time in
+/// seconds, so the one-second window follows playback time: a variable-frame-
+/// rate clip can show one damaged frame for seconds.
+fn summarize(frames: &[f64], durations: &[f64]) -> VmafScore {
     let mean = frames.iter().sum::<f64>() / frames.len() as f64;
     let mut sorted = frames.to_vec();
     sorted.sort_by(f64::total_cmp);
     let p1 = sorted[sorted.len() / 100];
-    let window = window.clamp(1, frames.len());
-    let worst_second = frames
-        .windows(window)
-        .map(|w| w.iter().sum::<f64>() / window as f64)
-        .fold(f64::INFINITY, f64::min);
+
+    // Piecewise-constant score over time; area(t) integrates it from 0 to t.
+    let mut starts = Vec::with_capacity(frames.len());
+    let mut cum = Vec::with_capacity(frames.len() + 1);
+    let (mut t, mut area) = (0.0, 0.0);
+    cum.push(0.0);
+    for (v, d) in frames.iter().zip(durations) {
+        starts.push(t);
+        t += d;
+        area += v * d;
+        cum.push(area);
+    }
+    let total = t;
+    let window = total.min(1.0);
+    let area_at = |t: f64| {
+        let i = starts.partition_point(|&s| s <= t).saturating_sub(1);
+        cum[i] + frames[i] * (t - starts[i]).clamp(0.0, durations[i])
+    };
+    // The minimum of a moving average of a step function sits where a window
+    // edge meets a frame boundary.
+    let worst_second = if window > 0.0 {
+        starts
+            .iter()
+            .flat_map(|&s| [s, s - window])
+            .chain(std::iter::once(total - window))
+            .map(|a| a.clamp(0.0, total - window))
+            .map(|a| (area_at(a + window) - area_at(a)) / window)
+            .fold(f64::INFINITY, f64::min)
+    } else {
+        mean
+    };
     VmafScore {
         mean,
         p1,
@@ -153,52 +220,56 @@ fn summarize(frames: &[f64], window: usize) -> VmafScore {
     }
 }
 
-/// Decoded frame count, average frame rate and coded size of the first video
-/// stream. Counting decodes the whole stream: packet counts differ from
-/// presented frames under edit lists and discarded packets.
-fn probe_frames(input: &Path) -> Result<(usize, f64, u32, u32)> {
-    let out = run_tool(
+/// Display duration in seconds of every decoded frame of the first video
+/// stream, in presentation order. Decoding the whole stream also proves it
+/// decodes cleanly; packet counts differ from presented frames under edit
+/// lists and discarded packets.
+fn probe_frames(input: &Path) -> Result<Vec<f64>> {
+    let out = run_clean(
         Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "v:0", "-count_frames"])
-            .args([
-                "-show_entries",
-                "stream=nb_read_frames,avg_frame_rate,width,height",
-            ])
-            .args(["-of", "default=noprint_wrappers=1"])
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "frame=best_effort_timestamp_time"])
+            .args(["-of", "csv=p=0"])
             .arg(input),
     )?;
-    let text = String::from_utf8_lossy(&out);
-    let field = |key: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-            .unwrap_or("")
-    };
-    let bad = |what: &str| PipelineError::Transcoder(format!("ffprobe reported no {what}").into());
-    let frames = field("nb_read_frames")
+    let pts: Vec<f64> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect();
+    let format = run_tool(
+        Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(input),
+    )?;
+    let end: f64 = String::from_utf8_lossy(&format)
+        .trim()
         .parse()
-        .map_err(|_| bad("frame count"))?;
-    let fps = match field("avg_frame_rate").split_once('/') {
-        Some((n, d)) => n.parse::<f64>().unwrap_or(0.0) / d.parse::<f64>().unwrap_or(0.0),
-        None => 0.0,
-    };
-    let width = field("width").parse().map_err(|_| bad("width"))?;
-    let height = field("height").parse().map_err(|_| bad("height"))?;
-    Ok((frames, fps, width, height))
+        .unwrap_or(0.0);
+    let mut durations: Vec<f64> = pts.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+    if let Some(&last) = pts.last() {
+        // The last frame lasts until the container ends, or one typical frame.
+        let typical = durations.last().copied().unwrap_or(0.0);
+        durations.push(if end > last { end - last } else { typical });
+    }
+    Ok(durations)
 }
 
 /// VMAF of `distorted` against `reference`, both decoded with their display
-/// rotation applied and compared at 10-bit, with Netflix's 4K model for 4K
-/// sources.
+/// rotation applied and compared at 10-bit with VMAF's default model. The 4K
+/// model was tried and is more lenient on native 4K blur, so it is not used.
 ///
 /// Frames are paired by index, not timestamp: a variable-frame-rate source and
 /// its re-muxed encode round timestamps differently, and timestamp pairing then
 /// scores many frames against a neighbour (a 60 fps phone clip read VMAF ~54
 /// instead of ~95). Index pairing is only sound for equal streams, so both
-/// decoded frame counts and the scored frame count must match, and framesync
-/// may not repeat or extend frames. Any mismatch keeps the original.
+/// files must decode without errors, both decoded frame counts and the scored
+/// frame count must match, and framesync may not repeat or extend frames. Any
+/// mismatch keeps the original.
 fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScore> {
-    let (ref_frames, fps, width, height) = probe_frames(reference)?;
-    let (enc_frames, ..) = probe_frames(distorted)?;
+    let durations = probe_frames(reference)?;
+    let enc_frames = probe_frames(distorted)?.len();
+    let ref_frames = durations.len();
     if ref_frames == 0 || enc_frames != ref_frames {
         return Err(PipelineError::Keep(format!(
             "encode has {enc_frames} frames, source has {ref_frames}"
@@ -206,15 +277,10 @@ fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScor
     }
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let model = if width.max(height) >= 3840 {
-        ":model=version=vmaf_4k_v0.6.1"
-    } else {
-        ""
-    };
     let graph = format!(
         "[0:v]format=yuv420p10le,settb=1/1000,setpts=N[d];\
          [1:v]format=yuv420p10le,settb=1/1000,setpts=N[r];\
-         [d][r]libvmaf=n_threads={threads}:shortest=1:repeatlast=0{model}:\
+         [d][r]libvmaf=n_threads={threads}:shortest=1:repeatlast=0:\
          log_fmt=json:log_path={}",
         log.display()
     );
@@ -244,7 +310,7 @@ fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScor
             frames.len()
         )));
     }
-    Ok(summarize(&frames, fps.round() as usize))
+    Ok(summarize(&frames, &durations))
 }
 
 #[async_trait]
@@ -282,11 +348,16 @@ impl Transcoder for SvtAv1UhqTranscoder {
         let input_bytes = std::io::copy(&mut input, &mut input_file).map_err(PipelineError::Io)?;
         drop(input_file);
 
-        let codec = probe_video_codec(&input_path)?;
+        let (codec, transfer) = probe_video_codec(&input_path)?;
         if codec.is_empty() || codec == "av1" {
             return Err(PipelineError::Keep(format!(
                 "source video codec is {:?}",
                 if codec.is_empty() { "none" } else { &codec }
+            )));
+        }
+        if HDR_TRANSFERS.contains(&transfer.as_str()) {
+            return Err(PipelineError::Keep(format!(
+                "HDR source ({transfer}) is outside the SDR VMAF gate"
             )));
         }
 
@@ -379,10 +450,70 @@ mod tests {
         // Five black frames in five seconds at 60 fps: the mean still clears 95.
         let mut frames = vec![99.0; 300];
         frames[100..105].fill(0.0);
-        let score = summarize(&frames, 60);
+        let durations = vec![1.0 / 60.0; 300];
+        let score = summarize(&frames, &durations);
         assert!(score.mean >= 95.0);
         assert!(!score.passes(95.0), "{score}");
-        assert!(summarize(&[99.0; 300], 60).passes(95.0));
+        assert!(summarize(&[99.0; 300], &durations).passes(95.0));
+    }
+
+    #[test]
+    fn worst_second_follows_display_time() {
+        // One damaged frame held for two seconds of a VFR clip, among 299 good
+        // frames: per-frame statistics stay high, but playback shows damage.
+        let mut frames = vec![99.0; 300];
+        frames[150] = 0.0;
+        let mut durations = vec![1.0 / 60.0; 300];
+        durations[150] = 2.0;
+        let score = summarize(&frames, &durations);
+        assert!(score.mean >= 95.0 && score.p1 >= 90.0, "{score}");
+        assert!(score.worst_second < 1.0, "{score}");
+        assert!(!score.passes(95.0));
+    }
+
+    #[tokio::test]
+    async fn hdr_source_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("hdr.mp4");
+        run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi"])
+                .arg("-i")
+                .arg(
+                    "testsrc2=size=320x240:rate=30:duration=1,setparams=\
+                     color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+                )
+                .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p10le"])
+                .arg(&src),
+        )
+        .unwrap();
+        let result = SvtAv1UhqTranscoder::new(20)
+            .with_preset(10)
+            .transcode(Box::new(std::fs::File::open(&src).unwrap()), &asset())
+            .await;
+        assert!(matches!(result, Err(PipelineError::Keep(_))));
+    }
+
+    /// A damaged source decodes "successfully" with fewer frames; equal frame
+    /// counts must not hide that.
+    #[test]
+    fn decode_errors_keep_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = vfr_clip(dir.path());
+        let whole = dir.path().join("whole.mp4");
+        run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-i"])
+                .arg(&src)
+                .args(["-c", "copy", "-movflags", "+faststart"])
+                .arg(&whole),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&whole).unwrap();
+        let cut = dir.path().join("cut.mp4");
+        std::fs::write(&cut, &bytes[..bytes.len() * 4 / 5]).unwrap();
+        let result = score_vmaf(&cut, &cut, &dir.path().join("vmaf.json"));
+        assert!(matches!(result, Err(PipelineError::Keep(_))), "{result:?}");
     }
 
     /// Presentation timestamps of the first video stream, in seconds.
@@ -520,7 +651,7 @@ mod tests {
         let TranscodedPayload::File { path, _guard } = out.payload else {
             panic!("expected file payload");
         };
-        assert_eq!(probe_video_codec(&path).unwrap(), "av1");
+        assert_eq!(probe_video_codec(&path).unwrap().0, "av1");
 
         // A display matrix adds stream side data that broke CSV probing.
         let rotated = dir.path().join("rotated.mp4");

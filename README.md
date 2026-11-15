@@ -161,15 +161,15 @@ and the perceptual (VQ) tune. The first encode uses CRF 28 (`--video-crf`). If
 it scores below the VMAF floor, it is retried at CRF 24 and then 20, so each
 video gets the smallest file that still passes. Every frame and its timestamp
 are kept, so variable-frame-rate phone clips stay in sync and are scored frame
-for frame. HDR colour tags, creation time, and the
+for frame. Creation time and the
 Apple location/make/model keys are kept; the display rotation is applied to the
 pixels. Audio becomes 192 kb/s Opus. Sources already in AV1 are kept.
 
 Every replacement must be at most 90% of the original's size. Every video
-encode is scored with VMAF against its source, frame for frame, using Netflix's
-4K model for 4K sources. It must reach a mean of 95 (`--video-min-vmaf`), and
-both its worst 1% of frames and its worst one-second window must reach 90.
-Its frame count must equal the source's.
+encode is scored with VMAF against its source, frame for frame. It must reach a
+mean of 95 (`--video-min-vmaf`), and both its worst 1% of frames and its worst
+second of playback must reach 90. Both files must decode without errors and
+have the same number of frames. HDR (PQ/HLG) videos are kept as they are.
 An original that fails either check, or that the encoder cannot read, is kept
 and recorded in the state file so it is not retried.
 
