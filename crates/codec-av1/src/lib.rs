@@ -320,28 +320,40 @@ fn probe_timeline(input: &Path) -> Result<Timeline> {
     parse_timeline(&String::from_utf8_lossy(&out))
 }
 
-/// End of playback in seconds: the container duration, which covers every
-/// stream, so a still final frame is held for any remaining audio. A container
-/// that does not state it (a stream-written MKV) keeps the original: without
-/// it, a damaged last frame could hide behind an audio tail.
+/// End of playback in seconds, measured from the packets of every stream
+/// rather than trusted from the container header, which can be missing or
+/// understate a longer audio track. A still final frame is held until then.
 fn playback_end(input: &Path) -> Result<f64> {
-    let out = run_tool(
+    let out = run_clean(
         Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration"])
-            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .args(["-v", "error"])
+            .args(["-show_entries", "packet=pts_time,dts_time,duration_time"])
+            .args(["-of", "csv=p=0"])
             .arg(input),
     )?;
-    let text = String::from_utf8_lossy(&out);
-    text.trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|d| d.is_finite() && *d >= 0.0)
-        .ok_or_else(|| {
-            PipelineError::Keep(format!(
-                "source has no playback duration ({:?})",
-                text.trim()
-            ))
-        })
+    parse_packet_end(&String::from_utf8_lossy(&out))
+}
+
+/// Latest `time + duration` over `pts,dts,duration` packet lines. A packet
+/// with neither a finite pts nor dts keeps the original: its end is unknown.
+fn parse_packet_end(text: &str) -> Result<f64> {
+    let num = |v: Option<&str>| {
+        v.and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let mut end: Option<f64> = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.trim().trim_end_matches(',').split(',');
+        let (pts, dts, duration) = (parts.next(), parts.next(), parts.next());
+        let Some(t) = num(pts).or(num(dts)) else {
+            return Err(PipelineError::Keep(format!(
+                "packet without a timestamp ({line:?})"
+            )));
+        };
+        let e = t + num(duration).filter(|d| *d >= 0.0).unwrap_or(0.0);
+        end = Some(end.map_or(e, |m: f64| m.max(e)));
+    }
+    end.ok_or_else(|| PipelineError::Keep("source has no packets".into()))
 }
 
 /// VMAF of `distorted` against `reference`, both decoded with their display
@@ -403,10 +415,12 @@ fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScor
         )));
     }
     // The last frame stays on screen until playback ends, which a longer
-    // audio track can push seconds past its video sample duration.
+    // audio track can push seconds past its video sample duration. Hold it to
+    // the later end of the two files, so neither can understate it.
+    let ends = playback_end(reference)?.max(playback_end(distorted)?);
     let mut held = source.durations.clone();
     if let (Some(last_pts), Some(last)) = (source.pts.last(), held.last_mut()) {
-        *last = last.max(playback_end(reference)? - last_pts);
+        *last = last.max(ends - last_pts);
     }
     Ok(summarize(&frames, &held))
 }
@@ -645,24 +659,60 @@ mod tests {
         assert!(!score.passes(95.0), "{score}");
     }
 
-    /// A stream-written container states no duration, so the final frame's
-    /// hold is unknown; that must keep the original.
     #[test]
-    fn unknown_playback_end_keeps_the_original() {
+    fn packet_end_takes_the_latest_stream_and_needs_timestamps() {
+        let end = parse_packet_end("0.0,0.0,0.033\n1.9,1.9,0.1\n4.8,N/A,0.2\n").unwrap();
+        assert!((end - 5.0).abs() < 1e-9);
+        // dts stands in for a missing pts; a missing duration adds nothing.
+        assert!((parse_packet_end("N/A,2.5,N/A\n").unwrap() - 2.5).abs() < 1e-9);
+        for bad in ["0.0,0.0,0.1\nN/A,N/A,0.1\n", ""] {
+            assert!(
+                matches!(parse_packet_end(bad), Err(PipelineError::Keep(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A stream-written MKV states no container duration, yet its audio holds
+    /// a damaged final frame on screen; the packets must reveal that hold.
+    #[test]
+    fn durationless_container_still_holds_the_final_frame() {
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("stream.mkv");
-        let out = run_tool(
+        let mkv = |input: &Path, extra: &[&str], name: &str| {
+            let out = run_tool(
+                Command::new("ffmpeg")
+                    .args(["-nostdin", "-loglevel", "error", "-i"])
+                    .arg(input)
+                    .args(extra)
+                    .args(["-fps_mode", "passthrough", "-enc_time_base:v", "demux"])
+                    .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                    .args(["-c:a", "copy", "-f", "matroska", "-"]),
+            )
+            .unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, out).unwrap();
+            path
+        };
+        let mp4 = dir.path().join("tail.mp4");
+        run_tool(
             Command::new("ffmpeg")
                 .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
-                .arg("testsrc2=size=320x240:rate=30:duration=1")
+                .arg("testsrc2=size=320x240:rate=60:duration=2")
+                .args(["-f", "lavfi", "-i", "sine=f=440:d=5"])
                 .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
-                .args(["-f", "matroska", "-"]),
+                .args(["-c:a", "aac"])
+                .arg(&mp4),
         )
         .unwrap();
-        std::fs::write(&src, out).unwrap();
-        assert!(matches!(playback_end(&src), Err(PipelineError::Keep(_))));
-        let result = score_vmaf(&src, &src, &dir.path().join("vmaf.json"));
-        assert!(matches!(result, Err(PipelineError::Keep(_))), "{result:?}");
+        let src = mkv(&mp4, &[], "src.mkv");
+        let damaged = mkv(
+            &mp4,
+            &["-vf", "drawbox=c=black:t=fill:enable='eq(n,119)'"],
+            "damaged.mkv",
+        );
+        assert!(playback_end(&src).unwrap() > 4.9);
+        let score = score_vmaf(&damaged, &src, &dir.path().join("vmaf.json")).unwrap();
+        assert!(!score.passes(95.0), "{score}");
     }
 
     #[tokio::test]
