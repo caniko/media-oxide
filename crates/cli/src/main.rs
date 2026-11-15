@@ -183,8 +183,9 @@ enum Command {
         #[arg(long)]
         taken_after: Option<String>,
 
-        /// AV1 CRF (0-63, lower = better).
-        #[arg(long, default_value_t = 20)]
+        /// First AV1 CRF tried (0-63, lower = better); lowered by 4 up to
+        /// twice while the encode misses the VMAF floor.
+        #[arg(long, default_value_t = 28)]
         video_crf: u32,
 
         /// SVT-AV1 preset (0-13, lower = slower and smaller).
@@ -246,8 +247,9 @@ enum Command {
         #[arg(long)]
         taken_after: Option<String>,
 
-        /// AV1 CRF (0-63, lower = better).
-        #[arg(long, default_value_t = 20)]
+        /// First AV1 CRF tried (0-63, lower = better); lowered by 4 up to
+        /// twice while the encode misses the VMAF floor.
+        #[arg(long, default_value_t = 28)]
         video_crf: u32,
 
         /// SVT-AV1 preset (0-13, lower = slower and smaller).
@@ -298,8 +300,8 @@ enum Command {
         #[arg(long)]
         api_key_file: Option<PathBuf>,
 
-        /// AV1 CRF.
-        #[arg(long, default_value_t = 20)]
+        /// First AV1 CRF tried.
+        #[arg(long, default_value_t = 28)]
         video_crf: u32,
 
         /// JXL distance.

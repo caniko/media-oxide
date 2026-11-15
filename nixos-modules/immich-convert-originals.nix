@@ -66,8 +66,8 @@ in
 
     videoCrf = mkOption {
       type = types.int;
-      default = 20;
-      description = "AV1 CRF value (0-63, lower = better quality).";
+      default = 28;
+      description = "First AV1 CRF tried (0-63, lower = better quality); lowered by 4 up to twice while the encode misses videoMinVmaf.";
     };
 
     videoPreset = mkOption {
