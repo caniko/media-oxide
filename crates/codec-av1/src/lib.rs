@@ -320,6 +320,23 @@ fn probe_timeline(input: &Path) -> Result<Timeline> {
     parse_timeline(&String::from_utf8_lossy(&out))
 }
 
+/// End of playback in seconds: the container duration, which covers every
+/// stream, so a still final frame is held for any remaining audio.
+fn playback_end(input: &Path) -> Result<f64> {
+    let out = run_tool(
+        Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(input),
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|d| d.is_finite())
+        .unwrap_or(0.0))
+}
+
 /// VMAF of `distorted` against `reference`, both decoded with their display
 /// rotation applied and compared at 10-bit with VMAF's default model. The 4K
 /// model was tried and is more lenient on native 4K blur, so it is not used.
@@ -378,7 +395,13 @@ fn score_vmaf(distorted: &Path, reference: &Path, log: &Path) -> Result<VmafScor
             frames.len()
         )));
     }
-    Ok(summarize(&frames, &source.durations))
+    // The last frame stays on screen until playback ends, which a longer
+    // audio track can push seconds past its video sample duration.
+    let mut held = source.durations.clone();
+    if let (Some(last_pts), Some(last)) = (source.pts.last(), held.last_mut()) {
+        *last = last.max(playback_end(reference)? - last_pts);
+    }
+    Ok(summarize(&frames, &held))
 }
 
 #[async_trait]
@@ -580,6 +603,39 @@ mod tests {
         let dv_side = "codec_name=hevc\ncodec_tag_string=hev1\ncolor_transfer=unknown\n\
                        side_data_type=DOVI configuration record\n";
         assert!(hdr_reason(dv_side).is_some());
+    }
+
+    /// A damaged final frame stays visible while a longer audio track plays
+    /// on; the worst second must weigh it for that whole hold.
+    #[test]
+    fn final_frame_held_by_audio_counts_in_the_worst_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("tail.mp4");
+        run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=320x240:rate=60:duration=2")
+                .args(["-f", "lavfi", "-i", "sine=f=440:d=5"])
+                .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                .args(["-c:a", "aac"])
+                .arg(&src),
+        )
+        .unwrap();
+        let damaged = dir.path().join("damaged.mp4");
+        run_tool(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-i"])
+                .arg(&src)
+                .args(["-vf", "drawbox=c=black:t=fill:enable='eq(n,119)'"])
+                .args(["-fps_mode", "passthrough", "-enc_time_base:v", "demux"])
+                .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+                .args(["-c:a", "copy"])
+                .arg(&damaged),
+        )
+        .unwrap();
+        let score = score_vmaf(&damaged, &src, &dir.path().join("vmaf.json")).unwrap();
+        assert!(score.mean >= 95.0 && score.p1 >= 90.0, "{score}");
+        assert!(!score.passes(95.0), "{score}");
     }
 
     #[tokio::test]
