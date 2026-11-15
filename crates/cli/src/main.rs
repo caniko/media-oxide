@@ -67,6 +67,10 @@ struct RuntimeConfig {
     filters: RuntimeFilters,
     state_path: Option<PathBuf>,
     manifest_path: Option<PathBuf>,
+    /// Whether the manifest also records skipped assets. A one-shot run keeps
+    /// them as its report; watch mode drops them, since every interval would
+    /// otherwise re-append one line per already-done or unsupported asset.
+    manifest_skipped: bool,
 }
 
 fn resolve_api_key(
@@ -270,7 +274,8 @@ enum Command {
         #[arg(long)]
         state_path: Option<PathBuf>,
 
-        /// Append-only JSONL manifest for all outcomes in this run.
+        /// Append-only JSONL manifest of every outcome except skips, which
+        /// would repeat for each unchanged asset on every interval.
         #[arg(long)]
         manifest_path: Option<PathBuf>,
     },
@@ -358,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_path,
                 manifest_path,
+                manifest_skipped: true,
             };
 
             let want_images = !video_only;
@@ -418,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 state_path,
                 manifest_path,
+                manifest_skipped: false,
             };
 
             let interval = parse_duration(&interval)?;
@@ -470,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
                 filters: RuntimeFilters::default(),
                 state_path: None,
                 manifest_path: None,
+                manifest_skipped: false,
             });
 
             tracing::info!("webhook server starting on {}", bind);
@@ -500,7 +508,7 @@ async fn run_pipeline(
     let manifest = cfg
         .manifest_path
         .as_deref()
-        .map(ManifestWriter::open)
+        .map(|path| ManifestWriter::open(path, cfg.manifest_skipped))
         .transpose()?;
 
     let summary = pipeline
@@ -659,16 +667,18 @@ struct AuditRecord {
 
 struct ManifestWriter {
     file: Mutex<File>,
+    record_skipped: bool,
 }
 
 impl ManifestWriter {
-    fn open(path: &Path) -> anyhow::Result<Self> {
+    fn open(path: &Path, record_skipped: bool) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             file: Mutex::new(file),
+            record_skipped,
         })
     }
 
@@ -678,6 +688,9 @@ impl ManifestWriter {
         write_mode: WriteMode,
         outcome: &AssetOutcome,
     ) -> anyhow::Result<()> {
+        if !self.record_skipped && matches!(outcome, AssetOutcome::Skipped { .. }) {
+            return Ok(());
+        }
         let record = AuditRecord {
             timestamp_unix_seconds: unix_timestamp(),
             label: label.to_string(),
@@ -1050,7 +1063,7 @@ mod tests {
     fn manifest_records_all_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.jsonl");
-        let manifest = ManifestWriter::open(&path).unwrap();
+        let manifest = ManifestWriter::open(&path, true).unwrap();
 
         manifest
             .record(
@@ -1073,6 +1086,35 @@ mod tests {
         let lines = std::fs::read_to_string(path).unwrap();
         assert_eq!(lines.lines().count(), 2);
         assert!(lines.contains("\"write_mode\":\"dry-run\""));
+        assert!(lines.contains("\"asset_id\":\"a2\""));
+    }
+
+    #[test]
+    fn watch_manifest_drops_skipped_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.jsonl");
+        let manifest = ManifestWriter::open(&path, false).unwrap();
+
+        manifest
+            .record(
+                "images (watch)",
+                WriteMode::TrashOriginal,
+                &AssetOutcome::Skipped {
+                    asset_id: "a1".into(),
+                    reason: "already completed".into(),
+                },
+            )
+            .unwrap();
+        manifest
+            .record(
+                "images (watch)",
+                WriteMode::TrashOriginal,
+                &success_outcome("a2", "new-a2"),
+            )
+            .unwrap();
+
+        let lines = std::fs::read_to_string(path).unwrap();
+        assert_eq!(lines.lines().count(), 1);
         assert!(lines.contains("\"asset_id\":\"a2\""));
     }
 

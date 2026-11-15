@@ -144,7 +144,7 @@ in
     manifestPath = mkOption {
       type = types.str;
       default = "${stateDir}/manifest.jsonl";
-      description = "Append-only JSONL manifest for all run outcomes.";
+      description = "Append-only JSONL manifest of every outcome except skips (the service runs `watch`, which would re-append them each interval).";
     };
   };
 
