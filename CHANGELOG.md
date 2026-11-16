@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Progressive JPEG XL cuts now map across ordered `jxlp` fragments and intervening boxes.
+
 - SVG uploads are validated against a namespace-aware allowlist rather than a
   denylist, so an XHTML-namespaced `<iframe srcdoc>` (which Chromium executes),
   `foreignObject`, event-handler attributes, `javascript:`/`data:` references,
@@ -45,6 +47,8 @@
   options are removed.
 
 ### Added
+
+- `media_oxide::jxl::transcode_jpeg` opts into progressive, byte-reversible JPEG transcoding without changing existing encoder defaults.
 
 - The `foundry` feature in `media-oxide`: the Foundry VTT conversion policy for
   tokens, maps, tiles, artwork, and audio. It plans and runs `ffmpeg`

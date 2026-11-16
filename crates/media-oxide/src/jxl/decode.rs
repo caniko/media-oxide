@@ -109,8 +109,7 @@ pub fn validate(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32)> {
 }
 
 /// Pixel dimensions only: the JXL header. Every container layout is accepted,
-/// including fragmented `jxlp`; only preview-cut discovery needs a single
-/// contiguous `jxlc`.
+/// including fragmented `jxlp`.
 pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     dimensions_from_reader(Cursor::new(bytes))
 }
@@ -168,10 +167,10 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
     if bytes.len() < usize::try_from(super::MIN_PREVIEW_FILE_BYTES).unwrap_or(usize::MAX) {
         return none;
     }
-    let Some((codestream_start, codestream)) = codestream_slice(bytes) else {
+    let Some((codestream, segments)) = codestream_parts(bytes) else {
         return none;
     };
-    let Ok(image) = JxlImage::builder().read(Cursor::new(codestream)) else {
+    let Ok(image) = JxlImage::builder().read(Cursor::new(&*codestream)) else {
         return none;
     };
     if image.num_loaded_keyframes() != 1 {
@@ -207,12 +206,10 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         else {
             return none;
         };
-        if cut > codestream.len() {
+        if cut >= codestream.len() {
             return none;
         }
-        let Some(file_preview) = codestream_start
-            .checked_add(cut)
-            .filter(|cut| *cut < bytes.len())
+        let Some(file_preview) = file_offset(&segments, cut).filter(|cut| *cut < bytes.len())
         else {
             return none;
         };
@@ -226,8 +223,8 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
                     .frame_offset(0)
                     .and_then(|offset| offset.checked_add(end))
             })
-            .filter(|cut| *cut <= codestream.len())
-            .and_then(|cut| codestream_start.checked_add(cut))
+            .filter(|cut| *cut < codestream.len())
+            .and_then(|cut| file_offset(&segments, cut))
             .filter(|cut| *cut < bytes.len())
             .map(|cut| cut as u64)
             .unwrap_or(file_preview as u64);
@@ -262,7 +259,7 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
     let Some(cut) = preview_offset.checked_add(preview_end) else {
         return none;
     };
-    if cut > codestream.len() {
+    if cut >= codestream.len() {
         return none;
     }
 
@@ -283,10 +280,7 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         return none;
     }
 
-    let Some(file_preview) = codestream_start
-        .checked_add(cut)
-        .filter(|cut| *cut < bytes.len())
-    else {
+    let Some(file_preview) = file_offset(&segments, cut).filter(|cut| *cut < bytes.len()) else {
         return none;
     };
     // The whole preview frame is the sharper cut: every LF-frame pass at
@@ -297,9 +291,9 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         .map(|group| group.offset + group.size as usize)
         .max()
         .and_then(|end| preview_offset.checked_add(end))
-        .filter(|end| *end <= keyframe_offset);
+        .filter(|end| *end <= keyframe_offset && *end < codestream.len());
     let tile = frame_end
-        .and_then(|end| codestream_start.checked_add(end))
+        .and_then(|end| file_offset(&segments, end))
         .filter(|cut| *cut < bytes.len())
         .map(|cut| cut as u64)
         .unwrap_or(file_preview as u64);
@@ -319,6 +313,61 @@ fn toc_cut(toc: &Toc, max_pass: u32) -> Option<usize> {
         })
         .map(|group| group.offset + group.size as usize)
         .max()
+}
+
+// Only ordered, complete fragments describe a valid logical codestream.
+fn codestream_parts(
+    bytes: &[u8],
+) -> Option<(std::borrow::Cow<'_, [u8]>, Vec<(usize, usize, usize)>)> {
+    if let Some((start, data)) = codestream_slice(bytes) {
+        return Some((
+            std::borrow::Cow::Borrowed(data),
+            vec![(0, data.len(), start)],
+        ));
+    }
+    if !bytes.starts_with(&super::CONTAINER_SIGNATURE) {
+        return None;
+    }
+    let mut pos = super::CONTAINER_SIGNATURE.len();
+    let mut data = Vec::new();
+    let mut segments = Vec::new();
+    let mut last = false;
+    while pos < bytes.len() {
+        let (header, len) = super::box_header(bytes, pos)?;
+        let end = pos.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        match &bytes[pos + 4..pos + 8] {
+            b"jxlc" => return None,
+            b"jxlp" => {
+                if last || len < header + 4 {
+                    return None;
+                }
+                let start = pos + header + 4;
+                let index = u32::from_be_bytes(bytes[start - 4..start].try_into().ok()?);
+                if index & 0x7fff_ffff != u32::try_from(segments.len()).ok()? {
+                    return None;
+                }
+                last = index & 0x8000_0000 != 0;
+                let logical = data.len();
+                data.extend_from_slice(&bytes[start..end]);
+                segments.push((logical, data.len(), start));
+            }
+            _ => {}
+        }
+        pos = end;
+    }
+    if !last || segments.is_empty() {
+        return None;
+    }
+    Some((std::borrow::Cow::Owned(data), segments))
+}
+
+fn file_offset(segments: &[(usize, usize, usize)], offset: usize) -> Option<usize> {
+    segments.iter().find_map(|&(start, end, file)| {
+        (offset > start && offset <= end).then(|| file + offset - start)
+    })
 }
 
 /// Codestream bytes and their file offset: a bare codestream, or a container
@@ -473,6 +522,8 @@ mod tests {
             out.extend_from_slice(b"jxlp");
             out.extend_from_slice(&index.to_be_bytes());
             out.extend_from_slice(part);
+            out.extend_from_slice(&8u32.to_be_bytes());
+            out.extend_from_slice(b"free");
         }
         out
     }
@@ -702,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_jxlp_images_decode_but_have_no_preview_cut() {
+    fn fragmented_jxlp_images_map_preview_cuts() {
         let dir = tempfile::tempdir().expect("temp");
         let input = dir.path().join("photo.png");
         let output = dir.path().join("photo.jxl");
@@ -720,6 +771,16 @@ mod tests {
                 .dimensions(),
             (320, 240)
         );
-        assert_eq!(cuts(&fragmented), Cuts::default());
+        let original = cuts(codestream);
+        let fragmented_cuts = cuts(&fragmented);
+        for (original, actual) in [
+            (original.preview, fragmented_cuts.preview),
+            (original.tile, fragmented_cuts.tile),
+        ] {
+            let original = original.expect("original cut") as usize;
+            let expected =
+                32 + original + 12 * original.div_ceil(4096) + 8 * ((original - 1) / 4096);
+            assert_eq!(actual, Some(expected as u64));
+        }
     }
 }
