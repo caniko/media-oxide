@@ -199,7 +199,7 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         }
         // A reversible JPEG transcode's first HF pass is most of the file, so
         // its preview is the DC layer plus HfGlobal and its tile that pass.
-        let jpeg = has_jpeg_reconstruction(bytes);
+        let jpeg = header.passes.num_passes > 1 && has_jpeg_reconstruction(bytes);
         let Some(preview_end) = toc_cut(frame.toc(), (!jpeg).then_some(0)) else {
             return none;
         };
@@ -847,6 +847,19 @@ mod tests {
         assert_eq!(
             image::image_dimensions(&painted).expect("painted"),
             (768, 512)
+        );
+
+        // A non-progressive transcode has one HF pass: no cut, served whole.
+        let single = dir.path().join("single.jxl");
+        let options = EncodeOptions {
+            distance: 0.0,
+            effort: 7,
+            progressive: false,
+        };
+        encode_file(&input, &single, &options).expect("cjxl");
+        assert_eq!(
+            super::cuts(&std::fs::read(&single).expect("read")),
+            Cuts::default()
         );
     }
 }
