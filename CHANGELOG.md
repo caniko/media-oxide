@@ -23,6 +23,9 @@
 ### Fixed
 
 - Progressive JPEG XL cuts now map across ordered `jxlp` fragments and intervening boxes.
+- Progressive reversible JPEG transcodes cut their preview at the DC layer
+  (about 3% of the file) instead of after the first HF pass (about 65%);
+  single-pass transcodes keep no cut and are served whole.
 
 - SVG uploads are validated against a namespace-aware allowlist rather than a
   denylist, so an XHTML-namespaced `<iframe srcdoc>` (which Chromium executes),
