@@ -114,6 +114,27 @@ pub fn encode_file(input: &Path, output: &Path, options: &EncodeOptions) -> Resu
     Ok(())
 }
 
+/// Reversibly transcode a JPEG to progressive JPEG XL. `djxl` can reconstruct
+/// the original JPEG bytes. Other inputs are rejected; ordinary [`encode_file`]
+/// behavior, including visually lossless JPEG encoding, is unchanged.
+pub fn transcode_jpeg(input: &Path, output: &Path, effort: u8) -> Result<()> {
+    use std::io::Read;
+    let mut signature = [0; 3];
+    std::fs::File::open(input)?.read_exact(&mut signature)?;
+    if signature != [0xff, 0xd8, 0xff] {
+        return Err(Error::Invalid("input is not a JPEG".to_string()));
+    }
+    encode_file(
+        input,
+        output,
+        &EncodeOptions {
+            distance: 0.0,
+            effort,
+            progressive: true,
+        },
+    )
+}
+
 /// Strip JPEG XL container metadata boxes (`Exif`, `xml `, `jumb`, and their
 /// Brotli-compressed `brob` wrappers) from an upload; bare codestreams carry
 /// none. `None` means no box was removed.
@@ -257,6 +278,30 @@ mod tests {
         bytes.extend_from_slice(&u64::MAX.to_be_bytes());
         let error = strip_metadata(&bytes).expect_err("overflowing box length is invalid");
         assert!(error.to_string().contains("JPEG XL box"), "{error}");
+    }
+
+    #[test]
+    fn reversible_jpeg_transcode_reconstructs_original() {
+        use image::ImageFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.jpg");
+        let output = dir.path().join("encoded.jxl");
+        let restored = dir.path().join("restored.jpg");
+        let image = image::RgbImage::from_fn(320, 240, |x, y| {
+            image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+        });
+        image.save_with_format(&input, ImageFormat::Jpeg).unwrap();
+        transcode_jpeg(&input, &output, 7).expect("cjxl");
+        assert!(std::process::Command::new("djxl")
+            .arg(&output)
+            .arg(&restored)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            std::fs::read(input).unwrap(),
+            std::fs::read(restored).unwrap()
+        );
     }
 
     /// Needs `cjxl` on PATH; skipped without it.

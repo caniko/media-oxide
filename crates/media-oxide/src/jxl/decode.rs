@@ -109,8 +109,7 @@ pub fn validate(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32)> {
 }
 
 /// Pixel dimensions only: the JXL header. Every container layout is accepted,
-/// including fragmented `jxlp`; only preview-cut discovery needs a single
-/// contiguous `jxlc`.
+/// including fragmented `jxlp`.
 pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     dimensions_from_reader(Cursor::new(bytes))
 }
@@ -168,10 +167,10 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
     if bytes.len() < usize::try_from(super::MIN_PREVIEW_FILE_BYTES).unwrap_or(usize::MAX) {
         return none;
     }
-    let Some((codestream_start, codestream)) = codestream_slice(bytes) else {
+    let Some((codestream, segments)) = codestream_parts(bytes) else {
         return none;
     };
-    let Ok(image) = JxlImage::builder().read(Cursor::new(codestream)) else {
+    let Ok(image) = JxlImage::builder().read(Cursor::new(&*codestream)) else {
         return none;
     };
     if image.num_loaded_keyframes() != 1 {
@@ -198,7 +197,10 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         {
             return none;
         }
-        let Some(preview_end) = toc_cut(frame.toc(), 0) else {
+        // A reversible JPEG transcode's first HF pass is most of the file, so
+        // its preview is the DC layer plus HfGlobal and its tile that pass.
+        let jpeg = header.passes.num_passes > 1 && has_jpeg_reconstruction(bytes);
+        let Some(preview_end) = toc_cut(frame.toc(), (!jpeg).then_some(0)) else {
             return none;
         };
         let Some(cut) = image
@@ -207,18 +209,16 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         else {
             return none;
         };
-        if cut > codestream.len() {
+        if cut >= codestream.len() {
             return none;
         }
-        let Some(file_preview) = codestream_start
-            .checked_add(cut)
-            .filter(|cut| *cut < bytes.len())
+        let Some(file_preview) = file_offset(&segments, cut).filter(|cut| *cut < bytes.len())
         else {
             return none;
         };
-        // The next pass (pass 1) is the sharper cut. A file with a single
-        // pass has no second cut: the small one already is the whole canvas.
-        let tile_end = toc_cut(frame.toc(), 1);
+        // The next pass is the sharper cut. A file with a single pass has no
+        // second cut: the small one already is the whole canvas.
+        let tile_end = toc_cut(frame.toc(), Some(if jpeg { 0 } else { 1 }));
         let tile = tile_end
             .filter(|end| *end > preview_end)
             .and_then(|end| {
@@ -226,8 +226,8 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
                     .frame_offset(0)
                     .and_then(|offset| offset.checked_add(end))
             })
-            .filter(|cut| *cut <= codestream.len())
-            .and_then(|cut| codestream_start.checked_add(cut))
+            .filter(|cut| *cut < codestream.len())
+            .and_then(|cut| file_offset(&segments, cut))
             .filter(|cut| *cut < bytes.len())
             .map(|cut| cut as u64)
             .unwrap_or(file_preview as u64);
@@ -256,13 +256,13 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
     let Some(preview_offset) = image.frame_offset(0) else {
         return none;
     };
-    let Some(preview_end) = toc_cut(preview.toc(), 0) else {
+    let Some(preview_end) = toc_cut(preview.toc(), Some(0)) else {
         return none;
     };
     let Some(cut) = preview_offset.checked_add(preview_end) else {
         return none;
     };
-    if cut > codestream.len() {
+    if cut >= codestream.len() {
         return none;
     }
 
@@ -283,10 +283,7 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         return none;
     }
 
-    let Some(file_preview) = codestream_start
-        .checked_add(cut)
-        .filter(|cut| *cut < bytes.len())
-    else {
+    let Some(file_preview) = file_offset(&segments, cut).filter(|cut| *cut < bytes.len()) else {
         return none;
     };
     // The whole preview frame is the sharper cut: every LF-frame pass at
@@ -297,9 +294,9 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
         .map(|group| group.offset + group.size as usize)
         .max()
         .and_then(|end| preview_offset.checked_add(end))
-        .filter(|end| *end <= keyframe_offset);
+        .filter(|end| *end <= keyframe_offset && *end < codestream.len());
     let tile = frame_end
-        .and_then(|end| codestream_start.checked_add(end))
+        .and_then(|end| file_offset(&segments, end))
         .filter(|cut| *cut < bytes.len())
         .map(|cut| cut as u64)
         .unwrap_or(file_preview as u64);
@@ -311,14 +308,88 @@ pub fn cuts(bytes: &[u8]) -> Cuts {
 
 /// The furthest end of the sections a renderer needs through `max_pass`:
 /// global and LF sections always, group passes up to that pass.
-fn toc_cut(toc: &Toc, max_pass: u32) -> Option<usize> {
+/// `None` keeps no group pass: the LF image plus HfGlobal.
+fn toc_cut(toc: &Toc, max_pass: Option<u32>) -> Option<usize> {
     toc.iter_bitstream_order()
         .filter(|group| match group.kind {
-            TocGroupKind::GroupPass { pass_idx, .. } => pass_idx <= max_pass,
+            TocGroupKind::GroupPass { pass_idx, .. } => max_pass.is_some_and(|max| pass_idx <= max),
             _ => true,
         })
         .map(|group| group.offset + group.size as usize)
         .max()
+}
+
+/// Whether the container carries `jbrd`, the data of a reversible JPEG transcode.
+fn has_jpeg_reconstruction(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(&super::CONTAINER_SIGNATURE) {
+        return false;
+    }
+    let mut pos = super::CONTAINER_SIGNATURE.len();
+    while let Some((_, len)) = super::box_header(bytes, pos) {
+        if &bytes[pos + 4..pos + 8] == b"jbrd" {
+            return true;
+        }
+        let Some(next) = pos.checked_add(len).filter(|end| *end <= bytes.len()) else {
+            return false;
+        };
+        pos = next;
+    }
+    false
+}
+
+// Only ordered, complete fragments describe a valid logical codestream.
+fn codestream_parts(
+    bytes: &[u8],
+) -> Option<(std::borrow::Cow<'_, [u8]>, Vec<(usize, usize, usize)>)> {
+    if let Some((start, data)) = codestream_slice(bytes) {
+        return Some((
+            std::borrow::Cow::Borrowed(data),
+            vec![(0, data.len(), start)],
+        ));
+    }
+    if !bytes.starts_with(&super::CONTAINER_SIGNATURE) {
+        return None;
+    }
+    let mut pos = super::CONTAINER_SIGNATURE.len();
+    let mut data = Vec::new();
+    let mut segments = Vec::new();
+    let mut last = false;
+    while pos < bytes.len() {
+        let (header, len) = super::box_header(bytes, pos)?;
+        let end = pos.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        match &bytes[pos + 4..pos + 8] {
+            b"jxlc" => return None,
+            b"jxlp" => {
+                if last || len < header + 4 {
+                    return None;
+                }
+                let start = pos + header + 4;
+                let index = u32::from_be_bytes(bytes[start - 4..start].try_into().ok()?);
+                if index & 0x7fff_ffff != u32::try_from(segments.len()).ok()? {
+                    return None;
+                }
+                last = index & 0x8000_0000 != 0;
+                let logical = data.len();
+                data.extend_from_slice(&bytes[start..end]);
+                segments.push((logical, data.len(), start));
+            }
+            _ => {}
+        }
+        pos = end;
+    }
+    if !last || segments.is_empty() {
+        return None;
+    }
+    Some((std::borrow::Cow::Owned(data), segments))
+}
+
+fn file_offset(segments: &[(usize, usize, usize)], offset: usize) -> Option<usize> {
+    segments.iter().find_map(|&(start, end, file)| {
+        (offset > start && offset <= end).then(|| file + offset - start)
+    })
 }
 
 /// Codestream bytes and their file offset: a bare codestream, or a container
@@ -473,6 +544,8 @@ mod tests {
             out.extend_from_slice(b"jxlp");
             out.extend_from_slice(&index.to_be_bytes());
             out.extend_from_slice(part);
+            out.extend_from_slice(&8u32.to_be_bytes());
+            out.extend_from_slice(b"free");
         }
         out
     }
@@ -702,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_jxlp_images_decode_but_have_no_preview_cut() {
+    fn fragmented_jxlp_images_map_preview_cuts() {
         let dir = tempfile::tempdir().expect("temp");
         let input = dir.path().join("photo.png");
         let output = dir.path().join("photo.jxl");
@@ -720,6 +793,73 @@ mod tests {
                 .dimensions(),
             (320, 240)
         );
-        assert_eq!(cuts(&fragmented), Cuts::default());
+        let original = cuts(codestream);
+        let fragmented_cuts = cuts(&fragmented);
+        for (original, actual) in [
+            (original.preview, fragmented_cuts.preview),
+            (original.tile, fragmented_cuts.tile),
+        ] {
+            let original = original.expect("original cut") as usize;
+            let expected =
+                32 + original + 12 * original.div_ceil(4096) + 8 * ((original - 1) / 4096);
+            assert_eq!(actual, Some(expected as u64));
+        }
+    }
+
+    /// A reversible JPEG transcode is one keyframe whose first HF pass is most
+    /// of the file: the preview is the DC layer plus HfGlobal, a small prefix.
+    #[test]
+    fn reversible_jpeg_cuts_stop_before_the_hf_pass() {
+        let dir = tempfile::tempdir().expect("temp");
+        let input = dir.path().join("noise.jpg");
+        let output = dir.path().join("noise.jxl");
+        let mut state = 17u32;
+        let image = image::RgbImage::from_fn(768, 512, |_, _| {
+            let mut next = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            };
+            image::Rgb([next(), next(), next()])
+        });
+        image
+            .save_with_format(&input, ImageFormat::Jpeg)
+            .expect("jpeg");
+        crate::jxl::transcode_jpeg(&input, &output, 7).expect("cjxl");
+        let bytes = std::fs::read(&output).expect("read");
+        let cuts = cuts(&bytes);
+        let preview = cuts.preview.expect("preview cut") as usize;
+        assert!(cuts.tile.expect("tile cut") as usize >= preview);
+        assert!(
+            preview * 10 < bytes.len(),
+            "cut {preview} of {}",
+            bytes.len()
+        );
+        let prefix = dir.path().join("prefix.jxl");
+        let painted = dir.path().join("prefix.png");
+        std::fs::write(&prefix, &bytes[..preview]).expect("write prefix");
+        assert!(std::process::Command::new("djxl")
+            .args(["--allow_partial_files"])
+            .arg(&prefix)
+            .arg(&painted)
+            .status()
+            .expect("djxl")
+            .success());
+        assert_eq!(
+            image::image_dimensions(&painted).expect("painted"),
+            (768, 512)
+        );
+
+        // A non-progressive transcode has one HF pass: no cut, served whole.
+        let single = dir.path().join("single.jxl");
+        let options = EncodeOptions {
+            distance: 0.0,
+            effort: 7,
+            progressive: false,
+        };
+        encode_file(&input, &single, &options).expect("cjxl");
+        assert_eq!(
+            super::cuts(&std::fs::read(&single).expect("read")),
+            Cuts::default()
+        );
     }
 }
