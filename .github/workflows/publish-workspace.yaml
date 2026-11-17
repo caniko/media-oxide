@@ -128,8 +128,11 @@ jobs:
         run: nix develop -c cargo clippy --locked -p rs-immicher-oxide --all-targets --all-features -- -D warnings
       - name: Document rs-immicher-oxide
         run: nix develop -c cargo doc --locked -p rs-immicher-oxide --no-deps --all-features
-      - name: Package coordinated release set
-        run: nix develop -c cargo package --locked --allow-dirty --no-verify -p media-oxide -p rs-immicher-oxide-core -p rs-immicher-oxide-backend-immich -p rs-immicher-oxide-codec-av1 -p rs-immicher-oxide-codec-jxl -p rs-immicher-oxide --target-dir "$RUNNER_TEMP/simit-package-target"
+      - name: Verify and package coordinated release set
+        run: |
+          set -euo pipefail
+          nix develop -c cargo --version | awk '{split($2, v, "."); exit !(v[1] > 1 || v[2] >= 89)}' || { echo 'Verifying a coordinated release set needs cargo >= 1.89 (temporary local registry overlay); pin a newer toolchain' >&2; exit 1; }
+          nix develop -c cargo package --locked --allow-dirty -p media-oxide -p rs-immicher-oxide-core -p rs-immicher-oxide-backend-immich -p rs-immicher-oxide-codec-av1 -p rs-immicher-oxide-codec-jxl -p rs-immicher-oxide --target-dir "$RUNNER_TEMP/simit-package-target"
       - name: Build immutable archive media-oxide
         run: |
           set -euo pipefail
@@ -137,6 +140,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p media-oxide | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/media-oxide"
           cp "$RUNNER_TEMP/simit-package-target/package/media-oxide-$version.crate" "$RUNNER_TEMP/simit-crates/media-oxide/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/media-oxide/media-oxide-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate media-oxide archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive media-oxide
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -152,6 +157,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p rs-immicher-oxide-core | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-core"
           cp "$RUNNER_TEMP/simit-package-target/package/rs-immicher-oxide-core-$version.crate" "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-core/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-core/rs-immicher-oxide-core-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate rs-immicher-oxide-core archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive rs-immicher-oxide-core
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -167,6 +174,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p rs-immicher-oxide-backend-immich | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-backend-immich"
           cp "$RUNNER_TEMP/simit-package-target/package/rs-immicher-oxide-backend-immich-$version.crate" "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-backend-immich/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-backend-immich/rs-immicher-oxide-backend-immich-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate rs-immicher-oxide-backend-immich archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive rs-immicher-oxide-backend-immich
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -182,6 +191,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p rs-immicher-oxide-codec-av1 | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-av1"
           cp "$RUNNER_TEMP/simit-package-target/package/rs-immicher-oxide-codec-av1-$version.crate" "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-av1/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-av1/rs-immicher-oxide-codec-av1-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate rs-immicher-oxide-codec-av1 archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive rs-immicher-oxide-codec-av1
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -197,6 +208,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p rs-immicher-oxide-codec-jxl | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-jxl"
           cp "$RUNNER_TEMP/simit-package-target/package/rs-immicher-oxide-codec-jxl-$version.crate" "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-jxl/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/rs-immicher-oxide-codec-jxl/rs-immicher-oxide-codec-jxl-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate rs-immicher-oxide-codec-jxl archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive rs-immicher-oxide-codec-jxl
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -212,6 +225,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p rs-immicher-oxide | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/rs-immicher-oxide"
           cp "$RUNNER_TEMP/simit-package-target/package/rs-immicher-oxide-$version.crate" "$RUNNER_TEMP/simit-crates/rs-immicher-oxide/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/rs-immicher-oxide/rs-immicher-oxide-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate rs-immicher-oxide archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive rs-immicher-oxide
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
