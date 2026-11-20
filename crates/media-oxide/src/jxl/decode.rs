@@ -337,10 +337,11 @@ fn has_jpeg_reconstruction(bytes: &[u8]) -> bool {
     false
 }
 
+/// A logical codestream and its `(start, end, file_offset)` fragment map.
+type CodestreamParts<'a> = (std::borrow::Cow<'a, [u8]>, Vec<(usize, usize, usize)>);
+
 // Only ordered, complete fragments describe a valid logical codestream.
-fn codestream_parts(
-    bytes: &[u8],
-) -> Option<(std::borrow::Cow<'_, [u8]>, Vec<(usize, usize, usize)>)> {
+fn codestream_parts(bytes: &[u8]) -> Option<CodestreamParts<'_>> {
     if let Some((start, data)) = codestream_slice(bytes) {
         return Some((
             std::borrow::Cow::Borrowed(data),
