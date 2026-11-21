@@ -1,10 +1,14 @@
-{ config, lib, pkgs, ... }:
-let
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}: let
   cfg = config.services.immich-convert-originals;
   inherit (lib) mkIf mkOption mkEnableOption types literalExpression;
   stateDir = "/var/lib/rs-immicher-oxide";
-  optionalArg = name: value: lib.optionals (value != null) [ name value ];
-  repeatedArgs = name: values: lib.concatMap (value: [ name value ]) values;
+  optionalArg = name: value: lib.optionals (value != null) [name value];
+  repeatedArgs = name: values: lib.concatMap (value: [name value]) values;
   execArgs =
     [
       "${cfg.package}/bin/rs-immicher-oxide"
@@ -30,12 +34,15 @@ let
       "--manifest-path"
       cfg.manifestPath
     ]
-    ++ optionalArg "--limit" (if cfg.limit == null then null else toString cfg.limit)
+    ++ optionalArg "--limit" (
+      if cfg.limit == null
+      then null
+      else toString cfg.limit
+    )
     ++ optionalArg "--created-after" cfg.createdAfter
     ++ optionalArg "--taken-after" cfg.takenAfter
     ++ repeatedArgs "--asset-id" cfg.assetIds;
-in
-{
+in {
   options.services.immich-convert-originals = {
     enable = mkEnableOption "Immich original transcoder (AV1/JXL)";
 
@@ -99,7 +106,7 @@ in
     };
 
     writeMode = mkOption {
-      type = types.enum [ "dry-run" "upload-only" "trash-original" ];
+      type = types.enum ["dry-run" "upload-only" "trash-original"];
       default = "dry-run";
       description = ''
         Runtime write behavior. Keep the default dry-run for production
@@ -156,7 +163,7 @@ in
       }
     ];
 
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [cfg.package];
 
     users.groups.immich-converter = {};
     users.users.immich-converter = {
@@ -166,8 +173,8 @@ in
 
     systemd.services.immich-convert-originals = {
       description = "Immich original transcoder — transpile to AV1/JXL";
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
+      after = ["network-online.target"];
+      wants = ["network-online.target"];
 
       # Originals and encodes are spooled to disk, never to a RAM-backed /tmp.
       environment.TMPDIR = "/var/tmp";

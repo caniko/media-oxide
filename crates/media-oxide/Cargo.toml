@@ -30,7 +30,10 @@ jxl-oxide = { version = "=0.12.6", optional = true }
 roxmltree = { version = "0.21", optional = true }
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+] }
 png = "=0.18.1"
 tempfile = "3"
 
