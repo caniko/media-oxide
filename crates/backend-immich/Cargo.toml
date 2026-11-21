@@ -14,7 +14,7 @@ include = ["Cargo.toml", "README.md", "src/**", "tests/**"]
 
 [dependencies]
 rs-immicher-oxide-core = { version = "0.1.0", path = "../core" }
-async-trait = "0.1"
+async-trait = "0.1.92"
 reqwest = { version = "0.12", features = ["stream", "multipart", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

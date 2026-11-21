@@ -9,7 +9,11 @@ description = "Command-line Immich media transcoding pipeline for AV1 video and 
 documentation = "https://docs.rs/rs-immicher-oxide"
 readme = "README.md"
 keywords = ["immich", "av1", "jxl", "transcode"]
-categories = ["command-line-utilities", "multimedia::images", "multimedia::video"]
+categories = [
+  "command-line-utilities",
+  "multimedia::images",
+  "multimedia::video",
+]
 include = ["Cargo.toml", "README.md", "src/**"]
 
 [[bin]]
@@ -29,7 +33,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 [dev-dependencies]
 tempfile = "3"
