@@ -13,7 +13,7 @@ categories = ["multimedia::images", "multimedia::video"]
 include = ["Cargo.toml", "README.md", "src/**"]
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.92"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

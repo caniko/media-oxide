@@ -46,6 +46,12 @@
           crossTargets = ["x86_64-unknown-linux-gnu"];
         };
         inherit (toolchain) craneLib;
+        inherit (rs-harbor.inputs) harbor-meta;
+        treefmt = harbor-meta.inputs.treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {
+          inherit harbor-meta;
+          harbor-rs = rs-harbor;
+          rustfmtPackage = toolchain.rustToolchain;
+        });
         cross = rs-harbor.lib.mkCross {
           inherit pkgs system;
         };
@@ -122,6 +128,7 @@
         );
       in {
         packages.default = package;
+        formatter = treefmt.config.build.wrapper;
 
         checks = {
           clippy = craneLib.mkCargoDerivation (
